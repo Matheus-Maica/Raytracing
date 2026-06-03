@@ -81,7 +81,7 @@ def ionosphere_electron_density(width, height, size, seed=None):
     return n_e
 
 if __name__ == "__main__":
-    matrix = ionosphere_electron_density(200, 200, size=1e6, seed=42)
+    matrix = ionosphere_electron_density(500, 500, size=1e6, seed=42)
 
     plt.matshow(matrix, cmap='viridis')
 

@@ -14,8 +14,8 @@ class Grid:
         self.height = height
 
         self.dt = dt # Time step in seconds
-        self.dx = 1.01 * np.sqrt(2) * dt * C # Spatial step in meters (can be adjusted based on the desired resolution)
-        self.dy = 1.01 * np.sqrt(2) * dt * C # Spatial step in meters (can be adjusted based on the desired resolution)
+        self.dx = 1.001 * np.sqrt(2) * dt * C # Spatial step in meters (can be adjusted based on the desired resolution)
+        self.dy = 1.001 * np.sqrt(2) * dt * C # Spatial step in meters (can be adjusted based on the desired resolution)
 
         # Stability condition for FDTD: dt < 1 / (C * sqrt(1/dx^2 + 1/dy^2))
         if self.dt >= 1 / (C * np.sqrt(1 / self.dx**2 + 1 / self.dy**2)):
@@ -40,11 +40,11 @@ class Grid:
 
         self.b_x, self.c_x, self.kappa_x, self.b_y, self.c_y, self.kappa_y, self.psi_Hz_x, self.psi_Hz_y, self.psi_Ex_y, self.psi_Ey_x = cpml.compute_cpml_parameters(self.dt)
 
-        self.X, self.G = self.compute_plasma_parameters(M=20, T=1000, lnLambda=10)
+        self.X, self.G = self.compute_plasma_parameters(M=5, T=1000, lnLambda=10)
 
     def compute_plasma_parameters(self, M=20, T=1000, lnLambda=10):
         # Compute plasma frequency and collision frequency based on electron density
-        self.omega_p = np.sqrt(self.n_e * q_e**2 / (epsilon_0 * m_e)) # Plasma frequency in rad/s
+        self.omega_p = self.n_e * q_e**2 / (epsilon_0 * m_e) # Plasma frequency in rad/s
         self.nu = 2.9e-6 * self.n_e * lnLambda / (T**1.5) # Collision frequency in Hz, where T is the electron temperature in K
 
         dt_c = self.dt / M # Sub-time step for plasma updates
@@ -85,7 +85,7 @@ class Grid:
 
             C_power = C_power @ C
 
-        omega_p_squared_dt_c = epsilon_0 * self.omega_p**2 * dt_c
+        omega_p_squared_dt_c = epsilon_0 * self.omega_p * dt_c
         G = (I + sum_Ck) @ (A_inv * omega_p_squared_dt_c[..., None, None])
 
         return X, G
@@ -171,7 +171,14 @@ class Grid:
             )
         )
 
-    def update_E(self, source_x=0, source_y=0, source_pos=None):
+
+    def source_time(self, t):
+        t0 = 40
+        tau = 10
+        x = (t - t0) / tau
+        return x * np.exp(-x**2)
+
+    def update_E(self, i, source_pos=None):
         interior = np.s_[1:-1, 1:-1]
 
         self.Ex[interior] += (
@@ -184,8 +191,6 @@ class Grid:
             )
         )
 
-        self.Ex[source_pos] += -self.dt / epsilon_0 * source_x
-
         self.Ey[interior] += (
             -self.dt / epsilon_0 * (self.Jy[interior])
             - self.dt / epsilon_0
@@ -196,7 +201,15 @@ class Grid:
             )
         )
 
-        self.Ey[source_pos] += -self.dt / epsilon_0 * source_y
+        # --- SOFT SOURCE INJECTION (IMPORTANT CHANGE) ---
+        if source_pos is not None:
+            s = 3 * self.source_time(i)
+
+            i, j = source_pos
+
+            # inject as a physical dipole-like excitation
+            self.Ex[i, j] += s
+            self.Ey[i, j] += s
 
     def update_CPML_memory_H(self):
         interior = np.s_[1:-1, 1:-1]
@@ -208,10 +221,10 @@ class Grid:
         self.psi_Ex_y[interior] = self.b_y[interior] * self.psi_Ex_y[interior] + self.c_y[interior] * (self.Hz[interior] - self.Hz[0:-2, 1:-1]) / self.dy
         self.psi_Ey_x[interior] = self.b_x[interior] * self.psi_Ey_x[interior] + self.c_x[interior] * (self.Hz[interior] - self.Hz[1:-1, 0:-2]) / self.dx
 
-grid = Grid(width=200, height=200, dt=5e-11)
+grid = Grid(width=500, height=500, dt=1e-11)
 animator = FieldAnimator()
 
-for i in range(1000):
+for i in range(400):
     grid.update_CPML_memory_H()
     grid.update_Hz()
     grid.update_CPML_memory_E()
@@ -223,7 +236,7 @@ for i in range(1000):
         source_x += 1
         source_y += 1
 
-    grid.update_E(source_x=source_x, source_y=source_y, source_pos=(40, 40)) # Example source: 1 MHz sinusoidal signal
+    grid.update_E(i, source_pos=(100, 100))
 
     if i % 5 == 0:
         plt.clf()
