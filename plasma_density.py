@@ -2,25 +2,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 def ionosphere_electron_density(width, height, size, seed=None):
-    """
-    Generate a synthetic 2D electron density profile for a patch of ionosphere.
+    # n_e = np.zeros((width, height))
 
-    Parameters
-    ----------
-    width : int
-        Number of grid points in x-direction
-    height : int
-        Number of grid points in y-direction
-    size : float
-        Physical area of the patch in m^2 (assumed square domain)
-    seed : int or None
-        Random seed for reproducibility
+    # n_e[:, int(width//2):] = 8e15
 
-    Returns
-    -------
-    n_e : np.ndarray of shape (width, height)
-        Electron density in m^-3
-    """
+    # return n_e
+
+
     if seed is not None:
         np.random.seed(seed)
 
@@ -31,7 +19,7 @@ def ionosphere_electron_density(width, height, size, seed=None):
     X, Y = np.meshgrid(x, y, indexing="ij")
 
     # --- 1. Background ionospheric density (F-region-ish) ---
-    n0 = 8e11  # typical mid-F region electron density [m^-3]
+    n0 = 8e15  # typical mid-F region electron density [m^-3]
 
     # gentle large-scale gradient (solar zenith / geomagnetic effects mimic)
     grad = 1 + 0.15 * (X / L) - 0.10 * (Y / L)
@@ -81,7 +69,7 @@ def ionosphere_electron_density(width, height, size, seed=None):
     return n_e
 
 if __name__ == "__main__":
-    matrix = ionosphere_electron_density(500, 500, size=1e6, seed=42)
+    matrix = ionosphere_electron_density(300, 300, size=1e6, seed=42)
 
     plt.matshow(matrix, cmap='viridis')
 

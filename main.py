@@ -40,7 +40,7 @@ class Grid:
 
         self.b_x, self.c_x, self.kappa_x, self.b_y, self.c_y, self.kappa_y, self.psi_Hz_x, self.psi_Hz_y, self.psi_Ex_y, self.psi_Ey_x = cpml.compute_cpml_parameters(self.dt)
 
-        self.X, self.G = self.compute_plasma_parameters(M=5, T=1000, lnLambda=10)
+        self.X, self.G = self.compute_plasma_parameters(M=100, T=1000, lnLambda=10)
 
     def compute_plasma_parameters(self, M=20, T=1000, lnLambda=10):
         # Compute plasma frequency and collision frequency based on electron density
@@ -90,7 +90,7 @@ class Grid:
 
         return X, G
 
-    def update_J(self):
+    def update_J(self, i, source_pos=None):
         interior = np.s_[1:-1, 1:-1]
 
         def avg4_Y(A):
@@ -153,6 +153,75 @@ class Grid:
         self.Jx[interior] = Jx_new[interior]
         self.Jy[interior] = Jy_new[interior]
 
+        def current_density(x_grid, y_grid,
+                            q, R, omega, t,
+                            x_center, y_center,
+                            dx, dy):
+            # ------------------------------------------------------------
+            # 1. Particle position (orbit around arbitrary center)
+            # ------------------------------------------------------------
+            x0 = x_center + R * np.cos(omega * t)
+            y0 = y_center + R * np.sin(omega * t)
+
+            # ------------------------------------------------------------
+            # 2. Particle velocity
+            # ------------------------------------------------------------
+            vx = -R * omega * np.sin(omega * t)
+            vy =  R * omega * np.cos(omega * t)
+
+            # ------------------------------------------------------------
+            # 3. Initialize current density fields
+            # ------------------------------------------------------------
+            Jx = np.zeros_like(x_grid)
+            Jy = np.zeros_like(y_grid)
+
+            # ------------------------------------------------------------
+            # 4. Convert physical position → grid indices
+            # ------------------------------------------------------------
+            i0 = int(np.round(x0 / dx))
+            j0 = int(np.round(y0 / dy))
+
+            # ------------------------------------------------------------
+            # 5. Smooth particle shape (avoids grid noise)
+            # ------------------------------------------------------------
+            sigma = 1.5  # in grid cells (tune: 1–2 is typical)
+
+            # ------------------------------------------------------------
+            # 6. Deposit current over local stencil
+            # ------------------------------------------------------------
+            for di in range(-3, 4):
+                for dj in range(-3, 4):
+
+                    i = i0 + di
+                    j = j0 + dj
+
+                    if 0 <= i < x_grid.shape[0] and 0 <= j < y_grid.shape[1]:
+
+                        # Gaussian shape function
+                        w = np.exp(-(di**2 + dj**2) / (2 * sigma**2))
+
+                        # IMPORTANT: normalize by cell area
+                        Jx[i, j] += q * vx * w / (dx * dy)
+                        Jy[i, j] += q * vy * w / (dx * dy)
+
+            return Jx, Jy
+        
+        Jx_source, Jy_source = current_density(
+            self.Jx,
+            self.Jy,
+            q=q_e * 10000,
+            R=4.0*self.dx,
+            omega=2*np.pi*1e9,
+            t=i * self.dt,
+            x_center=source_pos[0]*self.dx,
+            y_center=source_pos[1]*self.dy,
+            dx=self.dx,
+            dy=self.dy
+        )
+
+        self.Jx += Jx_source
+        self.Jy += Jy_source
+
     def update_Hz(self):
         interior = np.s_[1:-1, 1:-1]
 
@@ -171,14 +240,7 @@ class Grid:
             )
         )
 
-
-    def source_time(self, t):
-        t0 = 40
-        tau = 10
-        x = (t - t0) / tau
-        return x * np.exp(-x**2)
-
-    def update_E(self, i, source_pos=None):
+    def update_E(self):
         interior = np.s_[1:-1, 1:-1]
 
         self.Ex[interior] += (
@@ -201,16 +263,6 @@ class Grid:
             )
         )
 
-        # --- SOFT SOURCE INJECTION (IMPORTANT CHANGE) ---
-        if source_pos is not None:
-            s = 3 * self.source_time(i)
-
-            i, j = source_pos
-
-            # inject as a physical dipole-like excitation
-            self.Ex[i, j] += s
-            self.Ey[i, j] += s
-
     def update_CPML_memory_H(self):
         interior = np.s_[1:-1, 1:-1]
         self.psi_Hz_x[interior] = self.b_x[interior] * self.psi_Hz_x[interior] + self.c_x[interior] * (self.Ey[1:-1, 2:] - self.Ey[interior]) / self.dx
@@ -221,22 +273,18 @@ class Grid:
         self.psi_Ex_y[interior] = self.b_y[interior] * self.psi_Ex_y[interior] + self.c_y[interior] * (self.Hz[interior] - self.Hz[0:-2, 1:-1]) / self.dy
         self.psi_Ey_x[interior] = self.b_x[interior] * self.psi_Ey_x[interior] + self.c_x[interior] * (self.Hz[interior] - self.Hz[1:-1, 0:-2]) / self.dx
 
-grid = Grid(width=500, height=500, dt=1e-11)
+WIDTH = 300
+HEIGHT = 300
+
+grid = Grid(width=WIDTH, height=HEIGHT, dt=1e-11)
 animator = FieldAnimator()
 
-for i in range(400):
+for i in range(4000):
     grid.update_CPML_memory_H()
     grid.update_Hz()
     grid.update_CPML_memory_E()
-    grid.update_J()
-
-    source_x = 0
-    source_y = 0
-    if i == 1:
-        source_x += 1
-        source_y += 1
-
-    grid.update_E(i, source_pos=(100, 100))
+    grid.update_J(i, source_pos=(int(WIDTH//2), int(HEIGHT//2)))
+    grid.update_E()
 
     if i % 5 == 0:
         plt.clf()
@@ -252,8 +300,8 @@ for i in range(400):
         )
 
         plt.title(f"Step {i}")
-        plt.pause(0.01)
+        plt.pause(0.001)
 
-    # animator.add_frame(grid.Hz, grid.Hz)
+    # animator.add_frame(grid.Ex, grid.Ey)
 
 # animator.animate(interval=1)
