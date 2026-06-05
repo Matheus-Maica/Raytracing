@@ -5,8 +5,8 @@ from constants import mu_0, epsilon_0
 class CPML:
     def __init__(
         self,
-        grid_width,
         grid_height,
+        grid_width,
         thickness=10,
         alpha_max=0.1,
         kappa_max=5.0,

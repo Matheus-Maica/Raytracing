@@ -1,13 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-def ionosphere_electron_density(width, height, size, seed=None):
-    # n_e = np.zeros((width, height))
+def ionosphere_electron_density(height, width, size, seed=None):
+    n_e = np.zeros((height, width))
 
-    # n_e[:, int(width//2):] = 8e15
-
-    # return n_e
-
+    return n_e
 
     if seed is not None:
         np.random.seed(seed)

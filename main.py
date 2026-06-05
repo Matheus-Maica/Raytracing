@@ -8,14 +8,22 @@ from plasma_density import ionosphere_electron_density
 
 cyclotron_freq = q_e * B_0 / m_e # Cyclotron frequency in rad/s
 
+class Source:
+    def __init__(self, Q, R, omega, pos):
+        self.Q = Q
+        self.R = R
+        self.omega = omega
+        self.pos = pos
+
+
 class Grid:
     def __init__(self, width, height, dt=1e-9):
         self.width = width
         self.height = height
 
         self.dt = dt # Time step in seconds
-        self.dx = 1.001 * np.sqrt(2) * dt * C # Spatial step in meters (can be adjusted based on the desired resolution)
-        self.dy = 1.001 * np.sqrt(2) * dt * C # Spatial step in meters (can be adjusted based on the desired resolution)
+        self.dx = 1.01 * np.sqrt(2) * dt * C # Spatial step in meters (can be adjusted based on the desired resolution)
+        self.dy = 1.01 * np.sqrt(2) * dt * C # Spatial step in meters (can be adjusted based on the desired resolution)
 
         # Stability condition for FDTD: dt < 1 / (C * sqrt(1/dx^2 + 1/dy^2))
         if self.dt >= 1 / (C * np.sqrt(1 / self.dx**2 + 1 / self.dy**2)):
@@ -32,11 +40,11 @@ class Grid:
         self.Jy = np.zeros((height, width)) # Current density in y-direction
 
         # Additional plasma parameters
-        self.n_e = ionosphere_electron_density(width, height, size=height*width*self.dx*self.dy, seed=42) # Width and height of grid, physical area, and The answer to the Ultimate Question of Life, The Universe, and Everything.
-        self.nu = np.zeros((width, height)) # Collision frequency
+        self.n_e = ionosphere_electron_density(height, width, size=height*width*self.dx*self.dy, seed=42) # Width and height of grid, physical area, and The answer to the Ultimate Question of Life, The Universe, and Everything.
+        self.nu = np.zeros((height, width)) # Collision frequency
 
         # CPML parameters
-        cpml = CPML(width, height, cell_size=self.dx)
+        cpml = CPML(grid_height=height, grid_width=width, cell_size=self.dx)
 
         self.b_x, self.c_x, self.kappa_x, self.b_y, self.c_y, self.kappa_y, self.psi_Hz_x, self.psi_Hz_y, self.psi_Ex_y, self.psi_Ey_x = cpml.compute_cpml_parameters(self.dt)
 
@@ -89,8 +97,33 @@ class Grid:
         G = (I + sum_Ck) @ (A_inv * omega_p_squared_dt_c[..., None, None])
 
         return X, G
+    
+    def inject_source(self, i, source):
+        x_center = source.pos[0] * self.dx
+        y_center = source.pos[1] * self.dy
 
-    def update_J(self, i, source_pos=None):
+        q = source.Q
+        R = source.R
+        omega = source.omega
+        t = i * self.dt
+        sigma = 5 * self.dx
+
+        def Jx_density(ii, j):
+            Jx_source = -q * R * omega / (2 * np.pi * sigma**2) * np.sin(omega * t) * np.exp(-((ii*self.dx - x_center - R*np.cos(omega * t))**2 + (j*self.dy - y_center - R*np.sin(omega * t))**2) / (2 * sigma**2))
+
+            return Jx_source
+        
+        def Jy_density(ii, j):
+            Jy_source = q * R * omega / (2 * np.pi * sigma**2) * np.cos(omega * t) * np.exp(-((ii*self.dx - x_center - R*np.cos(omega * t))**2 + (j*self.dy - y_center - R*np.sin(omega * t))**2) / (2 * sigma**2))
+
+            return Jy_source
+
+        Jx_source = (1 - np.exp(-t*omega/(2*np.pi * 10))) * np.fromfunction(Jx_density, (self.height, self.width), dtype=np.float64)
+        Jy_source = (1 - np.exp(-t*omega/(2*np.pi * 10))) * np.fromfunction(Jy_density, (self.height, self.width), dtype=np.float64)
+
+        return Jx_source, Jy_source
+
+    def update_J(self, i, source):
         interior = np.s_[1:-1, 1:-1]
 
         def avg4_Y(A):
@@ -152,75 +185,17 @@ class Grid:
 
         self.Jx[interior] = Jx_new[interior]
         self.Jy[interior] = Jy_new[interior]
-
-        def current_density(x_grid, y_grid,
-                            q, R, omega, t,
-                            x_center, y_center,
-                            dx, dy):
-            # ------------------------------------------------------------
-            # 1. Particle position (orbit around arbitrary center)
-            # ------------------------------------------------------------
-            x0 = x_center + R * np.cos(omega * t)
-            y0 = y_center + R * np.sin(omega * t)
-
-            # ------------------------------------------------------------
-            # 2. Particle velocity
-            # ------------------------------------------------------------
-            vx = -R * omega * np.sin(omega * t)
-            vy =  R * omega * np.cos(omega * t)
-
-            # ------------------------------------------------------------
-            # 3. Initialize current density fields
-            # ------------------------------------------------------------
-            Jx = np.zeros_like(x_grid)
-            Jy = np.zeros_like(y_grid)
-
-            # ------------------------------------------------------------
-            # 4. Convert physical position → grid indices
-            # ------------------------------------------------------------
-            i0 = int(np.round(x0 / dx))
-            j0 = int(np.round(y0 / dy))
-
-            # ------------------------------------------------------------
-            # 5. Smooth particle shape (avoids grid noise)
-            # ------------------------------------------------------------
-            sigma = 1.5  # in grid cells (tune: 1–2 is typical)
-
-            # ------------------------------------------------------------
-            # 6. Deposit current over local stencil
-            # ------------------------------------------------------------
-            for di in range(-3, 4):
-                for dj in range(-3, 4):
-
-                    i = i0 + di
-                    j = j0 + dj
-
-                    if 0 <= i < x_grid.shape[0] and 0 <= j < y_grid.shape[1]:
-
-                        # Gaussian shape function
-                        w = np.exp(-(di**2 + dj**2) / (2 * sigma**2))
-
-                        # IMPORTANT: normalize by cell area
-                        Jx[i, j] += q * vx * w / (dx * dy)
-                        Jy[i, j] += q * vy * w / (dx * dy)
-
-            return Jx, Jy
         
-        Jx_source, Jy_source = current_density(
-            self.Jx,
-            self.Jy,
-            q=q_e * 10000,
-            R=4.0*self.dx,
-            omega=2*np.pi*1e9,
-            t=i * self.dt,
-            x_center=source_pos[0]*self.dx,
-            y_center=source_pos[1]*self.dy,
-            dx=self.dx,
-            dy=self.dy
-        )
+        Jx_source, Jy_source = self.inject_source(i, source)
 
-        self.Jx += Jx_source
-        self.Jy += Jy_source
+        source_region = 5 * source.R
+        row_start = int(max(0, source.pos[0] - source_region))
+        row_end = int(source.pos[0] + source_region + 1)
+        col_start = int(max(0, source.pos[1] - source_region))
+        col_end = int(source.pos[1] + source_region + 1)
+
+        self.Jx[row_start:row_end, col_start:col_end] += Jx_source[row_start:row_end, col_start:col_end]
+        self.Jy[row_start:row_end, col_start:col_end] += Jy_source[row_start:row_end, col_start:col_end]
 
     def update_Hz(self):
         interior = np.s_[1:-1, 1:-1]
@@ -276,19 +251,41 @@ class Grid:
 WIDTH = 300
 HEIGHT = 300
 
+
+SOURCE_FREQUENCY = 1e9
+SOURCE_CHARGE = 1e-12
+SOURCE_DIPOLE_RADIUS = 5
+
 grid = Grid(width=WIDTH, height=HEIGHT, dt=1e-11)
+source = Source(Q=SOURCE_CHARGE, R=SOURCE_DIPOLE_RADIUS*grid.dx, omega=2*np.pi*SOURCE_FREQUENCY, pos=(WIDTH//2, HEIGHT//2))
+
+print(f"Grid's physical size: {grid.dx * grid.width}m by {grid.dy * grid.height}m")
+print(f"Cell size: dx={grid.dx}, dy={grid.dy}")
+print(f"Resulting free space wavelength: {C / SOURCE_FREQUENCY}")
+print(f"Max frequency that can exist vs. source frequency: {1 / (2 * grid.dt)} vs {SOURCE_FREQUENCY}")
+
+print(f"COLLISION STABILITY CONDITION: NU * DT = {np.max(grid.nu) * grid.dt} -> SHOULD BE LESS THAN 0.1")
+print(f"PLASMA STABILITY: {np.sqrt(1 - (np.max(np.sqrt(grid.omega_p)) * grid.dt / 2)**2)} > 0.9")
+
+
 animator = FieldAnimator()
 
-for i in range(4000):
+for i in range(400000):
     grid.update_CPML_memory_H()
     grid.update_Hz()
     grid.update_CPML_memory_E()
-    grid.update_J(i, source_pos=(int(WIDTH//2), int(HEIGHT//2)))
+    grid.update_J(i, source=source)
     grid.update_E()
 
-    if i % 5 == 0:
+    if i % 10 == 0:
         plt.clf()
 
+        # dFx_dy, dFx_dx = np.gradient(grid.Ex, grid.dy, grid.dx, edge_order=2)
+        # dFy_dy, dFy_dx = np.gradient(grid.Ey, grid.dy, grid.dx, edge_order=2)
+
+        # divergence = dFx_dx + dFy_dy
+
+        # field = divergence
         field = np.sqrt(grid.Ex**2 + grid.Ey**2)
 
         plt.imshow(
