@@ -1,7 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-from animator import FieldAnimator
 from CPML import CPML
 from constants import C, mu_0, epsilon_0, B_0, m_e, q_e
 from plasma_density import ionosphere_electron_density
@@ -48,7 +47,7 @@ class Grid:
 
         self.b_x, self.c_x, self.kappa_x, self.b_y, self.c_y, self.kappa_y, self.psi_Hz_x, self.psi_Hz_y, self.psi_Ex_y, self.psi_Ey_x = cpml.compute_cpml_parameters(self.dt)
 
-        self.X, self.G = self.compute_plasma_parameters(M=100, T=1000, lnLambda=10)
+        self.X, self.G = self.compute_plasma_parameters(M=100, T=1000, lnLambda=3)
 
     def compute_plasma_parameters(self, M=20, T=1000, lnLambda=10):
         # Compute plasma frequency and collision frequency based on electron density
@@ -104,9 +103,9 @@ class Grid:
 
         q = source.Q
         R = source.R
-        omega = source.omega
         t = i * self.dt
-        sigma = 5 * self.dx
+        sigma = 6 * self.dx
+        omega = source.omega
 
         def Jx_density(ii, j):
             Jx_source = -q * R * omega / (2 * np.pi * sigma**2) * np.sin(omega * t) * np.exp(-((ii*self.dx - x_center - R*np.cos(omega * t))**2 + (j*self.dy - y_center - R*np.sin(omega * t))**2) / (2 * sigma**2))
@@ -117,13 +116,18 @@ class Grid:
             Jy_source = q * R * omega / (2 * np.pi * sigma**2) * np.cos(omega * t) * np.exp(-((ii*self.dx - x_center - R*np.cos(omega * t))**2 + (j*self.dy - y_center - R*np.sin(omega * t))**2) / (2 * sigma**2))
 
             return Jy_source
+        
+        def charge_density(ii, j):
+            return q / (2 * np.pi * sigma**2) * np.exp(-((ii*self.dx - x_center - R*np.cos(omega * t))**2 + (j*self.dy - y_center - R*np.sin(omega * t))**2) / (2 * sigma**2))
 
-        Jx_source = (1 - np.exp(-t*omega/(2*np.pi * 10))) * np.fromfunction(Jx_density, (self.height, self.width), dtype=np.float64)
-        Jy_source = (1 - np.exp(-t*omega/(2*np.pi * 10))) * np.fromfunction(Jy_density, (self.height, self.width), dtype=np.float64)
+        Jx_source = (1 - np.exp(-(t / (self.dt*20))**2)) * np.fromfunction(Jx_density, (self.height, self.width), dtype=np.float64)
+        Jy_source = (1 - np.exp(-(t / (self.dt*20))**2)) * np.fromfunction(Jy_density, (self.height, self.width), dtype=np.float64)
 
-        return Jx_source, Jy_source
+        rho_source = (1 - np.exp(-(t / (self.dt*20))**2)) * np.fromfunction(charge_density, (self.height, self.width), dtype=np.float64)
 
-    def update_J(self, i, source):
+        return Jx_source, Jy_source, rho_source
+
+    def update_J(self):
         interior = np.s_[1:-1, 1:-1]
 
         def avg4_Y(A):
@@ -167,35 +171,11 @@ class Grid:
         G10 = self.G[..., 1, 0]
         G11 = self.G[..., 1, 1]
 
-        # --- Jx update ---
-        Jx_new = (
-            G00 * self.Ex +
-            G01 * Ey_avg +
-            X00 * self.Jx +
-            X01 * Jy_avg
-        )
-
-        # --- Jy update ---
-        Jy_new = (
-            G10 * Ex_avg +
-            G11 * self.Ey +
-            X10 * Jx_avg +
-            X11 * self.Jy
-        )
+        Jx_new = (G00 * self.Ex + G01 * Ey_avg + X00 * self.Jx + X01 * Jy_avg)
+        Jy_new = (G10 * Ex_avg + G11 * self.Ey + X10 * Jx_avg + X11 * self.Jy)
 
         self.Jx[interior] = Jx_new[interior]
         self.Jy[interior] = Jy_new[interior]
-        
-        Jx_source, Jy_source = self.inject_source(i, source)
-
-        source_region = 5 * source.R
-        row_start = int(max(0, source.pos[0] - source_region))
-        row_end = int(source.pos[0] + source_region + 1)
-        col_start = int(max(0, source.pos[1] - source_region))
-        col_end = int(source.pos[1] + source_region + 1)
-
-        self.Jx[row_start:row_end, col_start:col_end] += Jx_source[row_start:row_end, col_start:col_end]
-        self.Jy[row_start:row_end, col_start:col_end] += Jy_source[row_start:row_end, col_start:col_end]
 
     def update_Hz(self):
         interior = np.s_[1:-1, 1:-1]
@@ -215,11 +195,13 @@ class Grid:
             )
         )
 
-    def update_E(self):
+    def update_E(self, i, source):
         interior = np.s_[1:-1, 1:-1]
 
+        Jx_source, Jy_source, rho_source = self.inject_source(i, source)
+
         self.Ex[interior] += (
-            -self.dt / epsilon_0 * (self.Jx[interior])
+            -self.dt / epsilon_0 * (self.Jx[interior] + Jx_source[interior])
             + self.dt / epsilon_0
             * (
                 (self.Hz[interior] - self.Hz[0:-2, 1:-1])
@@ -229,7 +211,7 @@ class Grid:
         )
 
         self.Ey[interior] += (
-            -self.dt / epsilon_0 * (self.Jy[interior])
+            -self.dt / epsilon_0 * (self.Jy[interior] + Jy_source[interior])
             - self.dt / epsilon_0
             * (
                 (self.Hz[interior] - self.Hz[1:-1, 0:-2])
@@ -237,6 +219,42 @@ class Grid:
                 + self.psi_Ey_x[interior]
             )
         )
+
+        # Enforce Gauss' law
+        max_iter = 100
+    
+        _, dEx_dx = np.gradient(self.Ex, self.dy, self.dx, edge_order=2)
+        dEy_dy, _ = np.gradient(self.Ey, self.dy, self.dx, edge_order=2)
+
+        electric_divergence = dEx_dx + dEy_dy
+
+        divergence_error = electric_divergence - rho_source
+
+        phi = np.zeros((self.height, self.width))
+
+        for _ in range(max_iter):
+            phi_new = phi.copy()
+
+            phi_new[1:-1, 1:-1] = (
+                phi[2:, 1:-1]
+                + phi[:-2, 1:-1]
+                + phi[1:-1, 2:]
+                + phi[1:-1, :-2]
+                - self.dx**2 * divergence_error[interior]
+            ) / 4
+
+            if np.max(np.abs(phi_new - phi)) < 1e-5:
+                phi = phi_new
+                break
+            
+            phi = phi_new
+        
+        phi_grad_y, phi_grad_x = np.gradient(phi, self.dy, self.dx)
+
+        self.Ex[interior] -= phi_grad_x[interior]
+        self.Ey[interior] -= phi_grad_y[interior]
+
+
 
     def update_CPML_memory_H(self):
         interior = np.s_[1:-1, 1:-1]
@@ -253,8 +271,8 @@ HEIGHT = 300
 
 
 SOURCE_FREQUENCY = 1e9
-SOURCE_CHARGE = 1e-12
-SOURCE_DIPOLE_RADIUS = 5
+SOURCE_CHARGE = 5e-13
+SOURCE_DIPOLE_RADIUS = 10
 
 grid = Grid(width=WIDTH, height=HEIGHT, dt=1e-11)
 source = Source(Q=SOURCE_CHARGE, R=SOURCE_DIPOLE_RADIUS*grid.dx, omega=2*np.pi*SOURCE_FREQUENCY, pos=(WIDTH//2, HEIGHT//2))
@@ -262,43 +280,45 @@ source = Source(Q=SOURCE_CHARGE, R=SOURCE_DIPOLE_RADIUS*grid.dx, omega=2*np.pi*S
 print(f"Grid's physical size: {grid.dx * grid.width}m by {grid.dy * grid.height}m")
 print(f"Cell size: dx={grid.dx}, dy={grid.dy}")
 print(f"Resulting free space wavelength: {C / SOURCE_FREQUENCY}")
-print(f"Max frequency that can exist vs. source frequency: {1 / (2 * grid.dt)} vs {SOURCE_FREQUENCY}")
+print(f"Max frequency that can exist vs. source frequency: {1 / (2 * grid.dt)} vs {SOURCE_FREQUENCY}. Is everything ok?: {SOURCE_FREQUENCY < 1 / (2 * grid.dt)}")
 
-print(f"COLLISION STABILITY CONDITION: NU * DT = {np.max(grid.nu) * grid.dt} -> SHOULD BE LESS THAN 0.1")
-print(f"PLASMA STABILITY: {np.sqrt(1 - (np.max(np.sqrt(grid.omega_p)) * grid.dt / 2)**2)} > 0.9")
+print(f"COLLISION STABILITY CONDITION: NU * DT = {np.max(grid.nu) * grid.dt} < 0.1")
+print(f"PLASMA STABILITY: {np.max(np.sqrt(grid.omega_p)) * grid.dt / 100} < 0.5")
+print(f"Cyclotron stability: {cyclotron_freq * grid.dt} < 1")
 
+print(f"Plasma frequency {np.mean(np.sqrt(grid.omega_p))}")
+print(f"Cyclotron frequency {cyclotron_freq}")
 
-animator = FieldAnimator()
-
-for i in range(400000):
+for i in range(4000):
     grid.update_CPML_memory_H()
     grid.update_Hz()
     grid.update_CPML_memory_E()
-    grid.update_J(i, source=source)
-    grid.update_E()
+    grid.update_J()
+    grid.update_E(i, source=source)
 
-    if i % 10 == 0:
+    if i % 3 == 0:
         plt.clf()
 
-        # dFx_dy, dFx_dx = np.gradient(grid.Ex, grid.dy, grid.dx, edge_order=2)
-        # dFy_dy, dFy_dx = np.gradient(grid.Ey, grid.dy, grid.dx, edge_order=2)
+        # Background: plasma density
+        plt.imshow(
+            grid.n_e,
+            origin="lower",
+            cmap="viridis"
+        )
 
-        # divergence = dFx_dx + dFy_dy
-
-        # field = divergence
+        # Overlay: electric field
         field = np.sqrt(grid.Ex**2 + grid.Ey**2)
 
         plt.imshow(
-            field.T,
-            origin='lower',
-            cmap='RdBu',
+            field,
+            origin="lower",
+            cmap="RdBu",
+            alpha=0.6,
             vmin=-0.1,
             vmax=0.1
         )
 
+        plt.colorbar(label="Electric field")
         plt.title(f"Step {i}")
+
         plt.pause(0.001)
-
-    # animator.add_frame(grid.Ex, grid.Ey)
-
-# animator.animate(interval=1)

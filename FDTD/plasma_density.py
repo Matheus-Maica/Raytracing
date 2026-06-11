@@ -2,10 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 def ionosphere_electron_density(height, width, size, seed=None):
-    n_e = np.zeros((height, width))
-
-    return n_e
-
     if seed is not None:
         np.random.seed(seed)
 
@@ -52,7 +48,7 @@ def ionosphere_electron_density(height, width, size, seed=None):
         x0 = np.random.uniform(0, L)
         y0 = np.random.uniform(0, L)
 
-        amp = np.random.uniform(-0.3, 0.5) * n0
+        amp = np.random.uniform(-100, 40) * n0
         sigma = np.random.uniform(0.03*L, 0.12*L)
 
         blobs += amp * np.exp(-((X - x0)**2 + (Y - y0)**2) / (2 * sigma**2))
