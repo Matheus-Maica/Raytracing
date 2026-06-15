@@ -1,150 +1,82 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 from constants import q_e, m_e, B_0, epsilon_0
-import matplotlib.pyplot as plt
+from visualization import plot_ray
+
 
 class Ray:
-    def __init__(self, electron_density, omega):
-        self.omega_p = lambda r : np.sqrt(electron_density(r) * q_e**2 / (epsilon_0 * m_e))
+    def __init__(self, omega, MODE, electron_density):
         self.omega = omega
+        self.MODE = MODE
+        self.electron_density = electron_density
 
-        self.X = lambda r : (self.omega_p(r) / self.omega)**2
-        self.Y = q_e * B_0 / (self.omega * m_e)
+    def grad_electron_density(self, x, y, z, h=100.0):
+        dNdx = (self.electron_density(x + h, y, z) - self.electron_density(x - h, y, z)) / (2 * h)
+        dNdy = (self.electron_density(x, y + h, z) - self.electron_density(x, y - h, z)) / (2 * h)
+        dNdz = (self.electron_density(x, y, z + h) - self.electron_density(x, y, z - h)) / (2 * h)
+        
+        return dNdx, dNdy, dNdz
 
-    def q(self, r, u):
-        alpha = 1 - self.X(r) - self.Y**2
-        beta = (self.Y**2 + (self.Y*u[2])**2) / 2
-        gamma = -(self.Y*u[2])**2
+    def haselgrove_rhs(self, tau, state):
+        x, y, z, ux, uy, uz = state
 
-        return -beta/alpha + np.sqrt((beta/alpha)**2 - gamma/alpha) - 1
+        dNdx, dNdy, dNdz = self.grad_electron_density(x, y, z)
 
-    def J(self, r, u):
-        return 2 * (2 * (1 - self.X(r) - self.Y**2)*(self.q(r, u) + 1) + self.Y**2 + (self.Y*u[2])**2)
+        X = self.electron_density(x, y, z) * q_e**2 / (epsilon_0 * m_e * self.omega**2)
+        Y = q_e * B_0 / (self.omega * m_e)
+
+        cosu = uz
+
+        a = 1.0 - X - Y**2
+        b = Y * (1.0 + cosu**2)
+        c = -cosu**2
+
+        p = (-b + self.MODE * np.sqrt(b**2 - 4 * a * c)) / (2 * a)
+
+        J = 2 * (2*a*p + Y*(1 - c))
+        K = -2 * X * cosu * (p * Y - 1.0)
+        L = Y * (1.0 - Y**2) * p**2 - 2 * a * p - Y
+
+        dxdt = J * ux
+        dydt = J * uy
+        dzdt = J * uz - K * Y
+
+        duxdt = L * q_e**2 / (epsilon_0 * m_e * self.omega) * dNdx
+        duydt = L * q_e**2 / (epsilon_0 * m_e * self.omega) * dNdy
+        duzdt = L * q_e**2 / (epsilon_0 * m_e * self.omega) * dNdz
+
+        return [dxdt, dydt, dzdt, duxdt, duydt, duzdt]
     
-    def K(self, r, u):
-        return -2 * self.q(r, u) * self.X(r) * self.Y * u[2]
-    
-    def L(self, r, u):
-        return (1 - self.Y**2) * (self.q(r, u) + 1)**2 - 2*(1 - self.X(r) - self.Y**2)*(self.q(r, u) + 1) - self.Y**2
+    def solve_haselgrove(self, r0, u0):
+        x0, y0, z0 = r0
+        ux0, uy0, uz0 = u0
 
-    def solve_system(
-        self,
-        t_span,
-        r0,
-        u0,
-        rtol=1e-8,
-        atol=1e-10
-    ):
-        def grad_omega_p(omega_p, r0):
-            h = max(1e-6, 1e-6*np.linalg.norm(r0))
+        state0 = [x0, y0, z0, ux0, uy0, uz0]
+        tau_span = (0.0, 10000.0)
 
-            grad = np.zeros(3)
-            for i in range(3):
-                dr = np.zeros(3)
-                dr[i] = h
-
-                grad[i] = (omega_p(r0 + dr) - omega_p(r0 - dr)) / (2 * h)
-
-            return grad
-
-        def rhs(t, y):
-            r = y[:3]
-            u = y[3:]
-
-            omega_p = self.omega_p(r)
-            grad_wp = grad_omega_p(self.omega_p, r)
-
-            drdt = self.J(r, u) * u - self.K(r, u) * np.array([0.0, 0.0, self.Y])
-
-            dudt = 2.0 * self.L(r, u) * (omega_p / self.omega) * grad_wp
-
-            return np.concatenate([drdt, dudt])
-
-        y0 = np.concatenate([r0, u0])
-
-        sol = solve_ivp(
-            rhs,
-            t_span,
-            y0,
+        return solve_ivp(
+            self.haselgrove_rhs,
+            tau_span,
+            state0,
             method="RK45",
-            t_eval = np.linspace(0, 10, 100000),
-            rtol=rtol,
-            atol=atol
+            max_step=1.0,
+            dense_output=True,
         )
-
-        return sol
     
+def electron_density(x, y, z):
+    Nm = 1.0e11
+    ym = 300 * 1000
+    H = 50.0 * 1000
+    yp = (y - ym) / H
+    return Nm * np.exp(0.5 * (1.0 - yp - np.exp(-yp)))
 
-def plot_ray(positions):
-    positions = np.asarray(positions)
+omega = 2 * np.pi * 10 * 1e+6
 
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
+ray = Ray(omega, MODE=1, electron_density=electron_density)
 
-    ax.plot(
-        positions[:, 0],
-        positions[:, 1],
-        positions[:, 2],
-        linewidth=2
-    )
+r0 = np.array([0.0, 0.0, 0.0])
+u0 = np.array([0.0, 1.0, 1.0]) / np.sqrt(2)
 
-    # Mark start and end points
-    ax.scatter(*positions[0], s=50, label="Start")
-    ax.scatter(*positions[-1], s=50, label="End")
+trajectory = ray.solve_haselgrove(r0, u0)
 
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-
-    ax.set_title("Ray Trajectory")
-    ax.legend()
-
-    plt.tight_layout()
-    plt.show()
-
-def electron_density(r):
-    x, y, z = r
-
-    # Prevent negative altitudes
-    h = max(y, 0.0)
-
-    # -------------------------
-    # Vertical profile
-    # -------------------------
-
-    peak_altitude = 300e3      # 300 km
-    scale_height = 80e3        # 80 km
-    peak_density = 1e12        # m^-3
-
-    vertical = peak_density * np.exp(
-        -((h - peak_altitude) / scale_height)**2
-    )
-
-    # -------------------------
-    # Horizontal structure
-    # -------------------------
-
-    horizontal = (
-        1
-        + 0.20*np.sin(2*np.pi*x/(500e3))
-        + 0.15*np.cos(2*np.pi*z/(700e3))
-    )
-
-    # -------------------------
-    # Localized density enhancement
-    # -------------------------
-
-    blob = 1 + 0.5*np.exp(
-        -((x - 200e3)**2 + (z + 100e3)**2)/(100e3)**2
-    )
-
-    return vertical * horizontal * blob
-
-ray = Ray(electron_density, 2*np.pi*5e6)
-
-u0 = np.array([0,1,1], dtype=float)
-u0 /= np.linalg.norm(u0)
-
-tracer = ray.solve_system(t_span=(0, 1e5), r0=np.array([1, 0, 0]), u0=u0)
-
-plot_ray(tracer.y[:3, :].T)
+plot_ray(trajectory.y[:3, :].T)
