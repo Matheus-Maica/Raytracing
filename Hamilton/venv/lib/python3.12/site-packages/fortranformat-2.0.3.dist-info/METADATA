@@ -1,0 +1,27 @@
+Metadata-Version: 2.3
+Name: fortranformat
+Version: 2.0.3
+Summary: Mimics Fortran textual IO in Python.
+Keywords: fortran,io,interface,format
+Author: Brendan Arnold
+Author-email: brendanarnold@gmail.com
+Requires-Python: >=3.8
+Classifier: Development Status :: 4 - Beta
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Natural Language :: English
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Fortran
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Scientific/Engineering
+Classifier: Topic :: Software Development :: Interpreters
+Classifier: Topic :: Text Processing :: General
+Project-URL: Repository, https://github.com/brendanarnold/py-fortranformat

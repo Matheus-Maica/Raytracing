@@ -1,0 +1,104 @@
+## Release Tag: v3.4.0
+
+-Improved internal solar zenith angle (SZA) calculations for greater consistency across E-CHAIM language versions (IDL, C, MATLAB).
+-Previous SZA threshold calculations caused discrepancies near internal boundaries; these have been reduced from ~0.006% to ~0.000002% of outputs within our test grid.
+
+## Release Tag: v3.3.0
+
+-The methods in which E-CHAIM interfaces with AACGM and its coefficients has been simplified
+-Improved the solar zenith angle calculation
+-The E-CHAIM primer has been updated
+
+## Release Tag: v3.2.6
+
+Updated AACGM to v2.7
+Updated some calculations to improve the consistency of the output with the Matlab version of E-CHAIM (note: this is still a work in progress).
+
+## Release Tag: 3.2.5
+
+Fixed an issue in the precipitation model that resulted in inconsistencies when magnetic latitudes or magnetic local times were near zero and AP is very high.
+
+Fixed an issue in the density calculations, which could occur in the early days of some years.
+
+
+## Release Tag: 3.2.3
+
+D-Region density calculations no longer fail if the user passes a NaN latitude of longitude as input.
+
+
+## Release Tag: 3.2.2
+
+- Added a check to the precipitation model to check for negative energies and fluxes. Negative values are set to 0.
+
+
+## Release Tag: 3.2.1
+
+-Fixed a bug in the precipitation model specific to the satellite mode option.
+-Forced dipole tilt year to 2000 due to drifting error
+
+
+## Release Tag: 3.1.1
+
+- Fixed a bug in the dipole tilt calculate for input times in 2020 and beyond. This affected the NmF2 and density outputs by upwards of 11%.
+
+
+## Release Tag: 3.1
+
+- Added a D region model to E-CHAIM
+
+
+## Release Tag: 3.0
+
+- The index aggregator has been rewritten. A new DB file is available for v3.0 and greater of the E-CHAIM software. This new DB file is NOT compatible with older versions of the software, and older versions of the DB file are NOT compatible with new versions of the E-CHAIM software. The older DB file will be made available to download only until Oct 1st, 2020.
+
+- Minor efficiency updates
+
+
+## Release Tag: 2.2.1
+
+Fixed an issue with the C code causing end of day/ start of day interpolation issues
+
+Added a flag for the precipitation model when using the input file
+
+
+## Release Tag: 2.2.0
+
+Modified the PC index interpolation for dates prior to Jan 1 1975.
+
+Fixed an issue in the precipitation model which was causing it to have no effect.
+
+
+## Release Tag: 2.0.0
+
+Added precipitation model to the density outputs (profile and satellite mode).
+
+
+## Release Tag: 1.4.0
+
+- Updated AACGM libary to v2.6 and the coefficients to IGRF 13.
+
+
+## Release Tag: 1.2.1
+
+-Bug fix to all output requiring AE for dates after the end of the AE record.
+
+
+## Release Tag: 1.2.0
+
+* An ‘expected output’ text file has been added to the examples folder. This file contains the expected output if the user runs the examples.c code. This is intended for the user to ensure that all parts of the model have been installed and compiled properly.
+* Improved the user front end ‘ECHAIM.c’ so that longer input lines can be used in the input file. Error checking has been added to alert the user if the lines lengths are too large.
+* Fixed a bug where the storm perturbation would be incorrect if a time resolution of less than 1 hour was used. This would occur for times before 1 hour UTC and later than 23 hours UTC.
+* The efficiency of the storm perturbation calculation routines have been significantly improved at the loss of the storm option array input for the density and satellite path functions. This means the user can longer choose some inputs to be calculated with the storm perturbation and some without for a single run of the above functions. The storm option is a not an integer, switching the storm perturbation function on or off for the entire input data set.
+* The AACGM components of the model have been updated to version 2.5. This includes the AACGM functions and the coefficients.
+
+
+## Release Tag: 1.1.1
+
+Storm NmF2: Increased stability during large (Kp > 8+) geomagnetic storms. Improved performance in data-sparse regions.
+
+
+## Release Tag: 1.0.1
+
+Bug fix: Negative NmF2/hmF2 values occurring for times within one hour of the end of day.
+
+
