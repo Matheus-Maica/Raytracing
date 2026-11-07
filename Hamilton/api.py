@@ -1,67 +1,68 @@
 """
-api.py — Hamilton's public interface.
+api.py -- Hamilton's public interface.
 
-Everything else in this project (main.py, raytracer.py, ionosphere.py,
-igrf.py, mc_scattering.py, link_budget.py, absorption.py, geometry.py,
-visualization.py, ECHAIM/) is the engine: correct, validated, but built as
-a set of cooperating pieces you have to wire together yourself (build an
-Ionosphere, build an IgrfField over the same patch, build a Ray from both,
-hand that to a RayTracer or MCScatteringTracer, unpack a TraceResult...).
-This module is the assembled version of that wiring, behind one class.
+The rest of the project (core/, geophysics/, raytracing/, propagation/, stochastic/, echoes/, receiver/, plotting/;
+see README.md) is the engine. This module wires it together behind one class, `Link`: an HF transmitter at a fixed
+place and time, whose ionosphere (E-CHAIM + IRI-2020) and magnetic field (IGRF) are built once, in the constructor.
+Everything after that reuses them.
 
+    from datetime import datetime
     from api import Link
 
     link = Link(57.0, 10.0, frequency_mhz=8.0, dt=datetime(2024, 6, 21, 14, 0))
-    ray = link.trace(elevation_deg=28.0)
-    print(ray)                          # human-readable one-shot summary
-    ray.plot().write_html("ray.html")   # interactive 3-D, opens in a browser
+    ray = link.trace(elevation_deg=28.0)                  # RayPath
+    print(ray)
+    fan = link.sweep_elevation(range(5, 50, 4))           # [RayPath, ...]
+    budget = link.link_budget(elevation_deg=28.0)         # LinkBudget: one-way dB budget of the leg
+    channel = link.channel(ray)                           # ChannelParams: HiCIRF stochastic channel of the leg
 
-    ensemble = link.scatter(elevation_deg=28.0, n_rays=200)
-    budget = link.link_budget(elevation_deg=28.0)
-
-A `Link` is a transmitter: a fixed place, a fixed moment in time (which
-pins down the ionosphere and geomagnetic field it sees), and a default
-carrier frequency and magneto-ionic mode. Everything expensive -- the
-E-CHAIM/IRI-2020 electron-density query, the IGRF-13 field query -- happens
-once, in the constructor, over a patch sized generously enough to cover
-every ray you go on to ask for. Tracing individual rays afterward (even at
-a different frequency or mode, or in a fan of many launch angles) is cheap,
-since it reuses that same patch.
-
-Units, deliberately not the engine's raw SI throughout: distances in km,
-frequency in MHz, angles in degrees, loss in dB, delay in ms -- the units
-someone doing HF link planning actually thinks in. Geocentric (ECEF)
-positions are the one exception, kept in metres to match geometry.py and
-so RayPath/ScatterResult can be handed straight to visualization.plot_ray
-with no conversion.
+    link.plot(fan, highlight=ray).savefig("rays.png")     # PHaRLAP-style figure + the red ray's HiCIRF channel
+    link.plot_3d(fan)                                     # PHaRLAP's 3-D lat/lon/height figure
+    link.plot_scattering_function(ray)                    # HiCIRF delay-Doppler scattering function
+    link.plot_html(fan).write_html("rays.html")           # interactive 3-D (Plotly)
 
 Public names
 ------------
-    Link              -- the entry point (see above)
-    RayPath           -- result of Link.trace() / one member of a ScatterResult
-    ScatterResult      -- result of Link.scatter()
-    LinkBudget         -- result of Link.link_budget()
+    Link               the entry point
+    RayPath            one traced ray (Link.trace, the sweep_* methods)
+    LinkBudget         one-way budget of one leg (Link.link_budget)
+    ScatterResult      Monte Carlo ensemble (Link.scatter -- the deprecated Monte Carlo layer, decision D6)
+    ChannelParams      HiCIRF channel of one leg (Link.channel, Link.leg_channel), from core.records
+    ChannelOptions     the channel options the spec leaves open, from stochastic.channel
+    IrregularityInputs the irregularity inputs of a Link, from core.inputs
+
+Units: km, MHz, degrees, dB, ms -- the units of HF link planning -- except ECEF positions (RayPath.path,
+launch_point, ...), which stay in metres, as core.geometry and plotting/ take them.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 
 import numpy as np
 
-from constants import C
-from geometry import xyz_m_to_latlon, latlon_to_xyz_m, ellipsoid_outward_normal_m
-from main import build_ionosphere_for_ray, Ray
-from igrf import build_igrf_for_ionosphere, IgrfField
-from ionosphere import Ionosphere
-from raytracer import RayTracer, TraceResult
-from mc_scattering import IrregularitySpectrum, MCScatteringTracer
-from link_budget import compute_receiver_statistics
-from visualization import plot_ray as _plot_ray
+from core.constants import C
+from core.geometry import ellipsoid_outward_normal_m, latlon_to_xyz_m, xyz_m_to_latlon
+from core.inputs import IrregularityInputs
+from core.records import ChannelParams, RaySamples
+from geophysics import environment
+from geophysics.igrf import IgrfField, build_igrf_for_ionosphere
+from geophysics.ionosphere import Ionosphere
+from propagation.link_budget import one_way_budget
+from raytracing.batch import BatchTracer, samples_from_record
+from raytracing.main import Ray, build_ionosphere_for_ray
+from raytracing.mc_scattering import IrregularitySpectrum, MCScatteringTracer
+from stochastic.channel import ChannelOptions, channel_parameters
+from stochastic.leg_screens import screens_for_leg
 
-__all__ = ["Link", "RayPath", "ScatterResult", "LinkBudget"]
+__all__ = ["Link", "RayPath", "LinkBudget", "ScatterResult", "ChannelParams", "ChannelOptions",
+           "IrregularityInputs"]
+
+Mode = Union[str, int]
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,8 @@ _MODE_TO_INT = {"o": 1, "x": -1, 1: 1, -1: -1}
 _INT_TO_MODE = {1: "O", -1: "X"}
 
 
-def _normalize_mode(mode: Union[str, int]) -> tuple[int, str]:
+def _normalize_mode(mode: Mode) -> tuple[int, str]:
+    """(+1 / -1, "O" / "X") from "O", "X" (any case), +1 or -1."""
     key = mode.lower() if isinstance(mode, str) else mode
     if key not in _MODE_TO_INT:
         raise ValueError(f"mode must be 'O', 'X', +1, or -1 -- got {mode!r}")
@@ -99,27 +101,36 @@ def _arrival_elevation_deg(r_final: np.ndarray, u_final: np.ndarray) -> float:
     return float(np.degrees(np.arcsin(np.clip(-np.dot(u_hat, up), -1.0, 1.0))))
 
 
+def _enu_frame(lat_deg: float, lon_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Local (up, north, east) unit vectors in ECEF, at a given geodetic (lat, lon)."""
+    lat_r, lon_r = np.deg2rad(lat_deg), np.deg2rad(lon_deg)
+    up = np.array([np.cos(lat_r) * np.cos(lon_r), np.cos(lat_r) * np.sin(lon_r), np.sin(lat_r)])
+    north = np.array([-np.sin(lat_r) * np.cos(lon_r), -np.sin(lat_r) * np.sin(lon_r), np.cos(lat_r)])
+    east = np.array([-np.sin(lon_r), np.cos(lon_r), 0.0])
+    return up, north, east
+
+
 # ---------------------------------------------------------------------------
 # RayPath
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class RayPath:
     """
     One traced HF ray, from launch to wherever it stopped.
 
-    Geometry (`path`, `bounce_points`, `launch_point`, `final_point`,
-    `final_direction`) is geocentric Cartesian (ECEF) metres -- Hamilton's
-    native frame, and what visualization.plot_ray expects, so a RayPath
-    can be plotted directly (`ray.plot()`, or pass several to
-    `Link.plot(...)`). Everything else is in the units an HF link budget
-    is normally read in: km, dB, ms, degrees.
+    Geometry (`path`, `bounce_points`, `launch_point`, `final_point`, `final_direction`) is geocentric Cartesian
+    (ECEF) metres, Hamilton's native frame; everything else is in km, dB, ms and degrees.
 
-    `status` is the quick answer to "what happened": "landed" (came back
-    to the WGS84 ellipsoid), "escaped" (crossed the model's altitude
-    ceiling, ~800 km, and kept going), or "incomplete" (used up its path
-    budget, or genuinely stalled, without doing either -- rare; means the
-    ray needs a longer max_path_km).
+    `status` is the quick answer to "what happened": "landed" (came back to the WGS84 ellipsoid), "escaped" (crossed
+    the model's ceiling, ~800 km, and kept going) or "incomplete" (used up its path budget first: give it a longer
+    max_path_km). `hops_completed` counts finished hops (a landed one-hop ray has 1).
+
+    `samples` is the full per-step record of the leg (core.records.RaySamples: position, directions, phase and
+    group path, Ne, B, the transported frame ...). It is what Link.channel() builds the leg's phase screens from, so
+    the HiCIRF channel is always that of this very ray. Rays from the deprecated Link.scatter() have none.
+
+    Equality is identity (the fields are arrays); compare `path` etc. explicitly if needed.
     """
 
     # --- what was asked for ---
@@ -133,26 +144,26 @@ class RayPath:
     escaped: bool
     hops_completed: int
 
-    # --- geometry, ECEF metres (matches geometry.py / visualization.plot_ray) ---
-    path: np.ndarray = field(repr=False)           # (n, 3)
-    arc_length: np.ndarray = field(repr=False)      # (n,) m, matches `path` row for row
-    bounce_points: np.ndarray = field(repr=False)   # (hops_completed, 3)
+    # --- geometry, ECEF metres ---
+    path: np.ndarray = field(repr=False)            # (n, 3)
+    arc_length: np.ndarray = field(repr=False)      # (n,) m, row for row with `path`
+    bounce_points: np.ndarray = field(repr=False)   # (number of bounces, 3)
     launch_point: np.ndarray = field(repr=False)    # (3,)
     final_point: np.ndarray = field(repr=False)     # (3,)
-    final_direction: np.ndarray = field(repr=False) # (3,) wave-normal, unit-ish
+    final_direction: np.ndarray = field(repr=False)  # (3,) wave normal, unit-ish
 
     # --- summary quantities ---
     ground_range_km: float
     arc_length_km: float
     phase_path_km: float
     group_path_km: float
-    group_delay_ms: float                  # group_path_km / c -- the physical delay
+    group_delay_ms: float                  # group_path_km / c: the physical delay
     absorption_db: float
-    arrival_elevation_deg: Optional[float] # None unless landed
-    sigma_phi2: Optional[float]            # rad^2, None unless phase_variance=True was requested
+    arrival_elevation_deg: Optional[float]  # None unless landed
+    sigma_phi2: Optional[float]            # rad^2 from the leg's phase screens; None unless trace(phase_variance=True)
 
-    # --- advanced / optional ---
-    tangent_map: Optional[np.ndarray] = field(default=None, repr=False)  # (6,6), only if tangent_map=True
+    # --- the traced leg itself ---
+    samples: Optional[RaySamples] = field(default=None, repr=False)
 
     @property
     def status(self) -> str:
@@ -171,69 +182,134 @@ class RayPath:
         return _latlon_deg(self.path)
 
     def plot(self, **kwargs):
-        """Interactive 3-D plot (plotly). See visualization.plot_ray for kwargs."""
-        return _plot_ray(self, **kwargs)
+        """PHaRLAP-style range-height figure of this ray (matplotlib Figure; plotting.figures.ray_slice_figure).
+        A RayPath carries no ionosphere, so the background is empty, as in PHaRLAP's ray-only plots; Link.plot(ray)
+        draws it over the Link's ionosphere, with its HiCIRF channel."""
+        from plotting.figures import ray_slice_figure
+        return ray_slice_figure([self], highlight=self, **kwargs)
+
+    def plot_3d(self, **kwargs):
+        """PHaRLAP's 3-D latitude/longitude/height figure (plotting.figures.rays_3d_figure)."""
+        from plotting.figures import rays_3d_figure
+        return rays_3d_figure([self], **kwargs)
+
+    def plot_html(self, **kwargs):
+        """The interactive 3-D Plotly scene (plotting.plotly_3d.plot_ray); .write_html(path) saves it."""
+        from plotting.plotly_3d import plot_ray
+        return plot_ray(self, **kwargs)
 
     def __str__(self) -> str:
         lat, lon = _latlon_deg(self.final_point[None, :])
         arrival = f"{self.arrival_elevation_deg:.1f}deg" if self.arrival_elevation_deg is not None else "n/a"
-        return (
+        lines = [
             f"RayPath({self.frequency_mhz:g} MHz, {self.mode}-mode, "
-            f"el={self.elevation_deg:g}deg az={self.azimuth_deg:g}deg)\n"
-            f"  status         : {self.status} ({self.hops_completed} hop(s))\n"
-            f"  landing        : {lat[0]:.2f}N {lon[0]:.2f}E, ground range {self.ground_range_km:.1f} km\n"
-            f"  arrival angle  : {arrival}\n"
-            f"  arc length     : {self.arc_length_km:.1f} km\n"
-            f"  group path     : {self.group_path_km:.1f} km  (delay {self.group_delay_ms:.3f} ms)\n"
-            f"  absorption     : {self.absorption_db:.2f} dB"
-        )
+            f"el={self.elevation_deg:g}deg az={self.azimuth_deg:g}deg)",
+            f"  status         : {self.status} ({self.hops_completed} hop(s))",
+            f"  end point      : {lat[0]:.2f}N {lon[0]:.2f}E, ground range {self.ground_range_km:.1f} km",
+            f"  arrival angle  : {arrival}",
+            f"  arc length     : {self.arc_length_km:.1f} km",
+            f"  group path     : {self.group_path_km:.1f} km  (delay {self.group_delay_ms:.3f} ms)",
+            f"  absorption     : {self.absorption_db:.2f} dB",
+        ]
+        if self.sigma_phi2 is not None:
+            lines.append(f"  phase variance : {self.sigma_phi2:.3g} rad^2")
+        return "\n".join(lines)
 
 
-def _build_ray_path(result: TraceResult, *, frequency_mhz: float, mode: str,
-                     elevation_deg: float, azimuth_deg: float) -> RayPath:
-    arrival = _arrival_elevation_deg(result.r_final, result.u_final) if result.landed else None
+def _ray_path_from_batch(res, samples, *, frequency_mhz: float, mode: str, elevation_deg: float,
+                         azimuth_deg: float, sigma_phi2: Optional[float]) -> RayPath:
+    """RayPath of one ray from a BatchResult (single ray) and its RaySamples (batch.samples_from_record)."""
+    landed = bool(res.landed[0])
+    arrival = _arrival_elevation_deg(res.r_final[0], res.u_final[0]) if landed else None
+    bounces = np.asarray(res.bounce_points[0], dtype=float).reshape(-1, 3)
     return RayPath(
         frequency_mhz=frequency_mhz, mode=mode,
         elevation_deg=elevation_deg, azimuth_deg=azimuth_deg,
-        landed=result.landed, escaped=result.escaped, hops_completed=result.hops_completed,
-        path=result.path, arc_length=result.s_path,
-        bounce_points=result.bounce_points,
-        launch_point=result.path[0], final_point=result.r_final,
-        final_direction=result.u_final,
-        ground_range_km=result.ground_range_total_m / 1e3,
-        arc_length_km=result.s_total / 1e3,
-        phase_path_km=result.phase_path_total / 1e3,
-        group_path_km=result.group_path_total / 1e3,
-        group_delay_ms=1e3 * result.group_path_total / C,
-        absorption_db=result.absorption_db_total,
+        landed=landed, escaped=bool(res.escaped[0]), hops_completed=int(res.hops[0]),
+        path=np.asarray(samples.r, dtype=float), arc_length=np.asarray(samples.s, dtype=float),
+        bounce_points=bounces,
+        launch_point=np.asarray(samples.r[0], dtype=float), final_point=np.asarray(res.r_final[0], dtype=float),
+        final_direction=np.asarray(res.u_final[0], dtype=float),
+        ground_range_km=float(res.ground_range_m[0]) / 1e3,
+        arc_length_km=float(res.s_total[0]) / 1e3,
+        phase_path_km=float(res.phase_path[0]) / 1e3,
+        group_path_km=float(res.group_path[0]) / 1e3,
+        group_delay_ms=1e3 * float(res.group_path[0]) / C,
+        absorption_db=float(res.absorption_db[0]),
         arrival_elevation_deg=arrival,
-        sigma_phi2=(result.sigma_phi2 if result.sigma_phi2 else None),
-        tangent_map=result.tangent_map_final,
+        sigma_phi2=sigma_phi2,
+        samples=samples,
     )
 
 
 # ---------------------------------------------------------------------------
-# ScatterResult
+# LinkBudget
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
+class LinkBudget:
+    """
+    The one-way budget of one leg (spec §6.2-§6.4, eq. 6.2-6.3): flux-tube focusing with the caustic cap (§4.5),
+    absorption, ground losses at every bounce, and the 3.01 dB polarization loss. There is no coherence term (spec
+    §6.3); the coherent/diffuse split is the HiCIRF channel's (Link.channel).
+
+    `total_db` is relative: focusing gain minus the losses. Hamilton has no transmitter EIRP, antenna gain or
+    receiver model, so `received_dBW` is set only when the caller gives Pt_dBW (and gains). `focusing_gain_db` and
+    `total_db` are None if the ray didn't land. `doppler_hz` is NaN: a single-epoch ionosphere has no Doppler.
+
+    `ray` is the full underlying RayPath, for anything not surfaced here directly.
+    """
+
+    landed: bool
+    ground_range_km: float
+    delay_ms: float
+    doppler_hz: float
+    focusing_gain_db: Optional[float]
+    caustic: bool
+    absorption_db: float
+    ground_loss_db: float
+    polarization_loss_db: float
+    total_db: Optional[float]
+    received_dBW: Optional[float]
+
+    ray: RayPath
+
+    def __str__(self) -> str:
+        foc = "n/a"
+        if self.focusing_gain_db is not None:
+            foc = f"{self.focusing_gain_db:+.2f} dB" + (" (caustic cap)" if self.caustic else "")
+        tot = f"{self.total_db:+.2f} dB" if self.total_db is not None else "n/a"
+        rec = f"{self.received_dBW:.1f} dBW" if self.received_dBW is not None else "not computed (no Pt)"
+        dop = "n/a (single epoch)" if self.doppler_hz != self.doppler_hz else f"{self.doppler_hz:+.2f} Hz"
+        return (
+            f"LinkBudget({self.ray.frequency_mhz:g} MHz, {self.ray.mode}-mode, "
+            f"el={self.ray.elevation_deg:g}deg): {'landed' if self.landed else 'did not land'}, "
+            f"{self.ground_range_km:.1f} km, delay {self.delay_ms:.3f} ms, Doppler {dop}\n"
+            f"  focusing gain  : {foc}\n"
+            f"  absorption     : -{self.absorption_db:.2f} dB\n"
+            f"  ground loss    : -{self.ground_loss_db:.2f} dB\n"
+            f"  polarization   : -{self.polarization_loss_db:.2f} dB\n"
+            f"  total          : {tot}  (relative only -- see class docstring)\n"
+            f"  received power : {rec}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ScatterResult (deprecated Monte Carlo layer)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, eq=False)
 class ScatterResult:
     """
-    A Monte Carlo ensemble of scattered rays (mc_scattering.py's Langevin
-    model of small-scale field-aligned ionospheric irregularities) around
-    one deterministic reference ray.
+    A Monte Carlo ensemble of scattered rays (mc_scattering.py's Langevin model of small-scale field-aligned
+    irregularities) around one deterministic reference ray. Result of Link.scatter(), the deprecated Monte Carlo
+    layer (decision D6); Link.channel() gives the HiCIRF statistics of a leg instead.
 
-    `reference` is the unscattered ray (same as Link.trace() would give
-    for this launch geometry). `rays` are the ensemble members that
-    landed (n_rays were launched; rays that didn't come down -- escaped,
-    or ran out of path budget -- are excluded from both `rays` and every
-    statistic below, matching mc_scattering.summarize()'s own convention).
+    `reference` is the unscattered ray. `rays` are the ensemble members that landed (n_rays were launched; rays
+    that did not come down are excluded from `rays` and from every statistic below).
 
-    `coherent_fraction` = exp(-mean(sigma_phi2)/2) is the fraction of
-    signal power that stays in a coherent wavefront rather than being
-    scattered into phase noise -- 1.0 is undisturbed, well below that
-    means the irregularities are strong enough to matter for anything
-    phase-sensitive (Doppler, coherent integration, ionosonde autoscaling).
+    `coherent_fraction` = exp(-mean(sigma_phi2)/2) is the fraction of signal power that stays in a coherent
+    wavefront: 1.0 is undisturbed; well below that, the irregularities matter for anything phase-sensitive.
     """
 
     reference: RayPath
@@ -254,8 +330,9 @@ class ScatterResult:
     coherent_fraction: float
 
     def plot(self, **kwargs):
-        """Interactive 3-D plot: reference ray highlighted, ensemble behind it."""
-        return _plot_ray([self.reference] + self.rays, highlight=self.reference, **kwargs)
+        """PHaRLAP-style range-height figure: the ensemble in white, the reference ray in red."""
+        from plotting.figures import ray_slice_figure
+        return ray_slice_figure([self.reference] + list(self.rays), highlight=self.reference, **kwargs)
 
     def __str__(self) -> str:
         return (
@@ -271,72 +348,17 @@ class ScatterResult:
 
 
 # ---------------------------------------------------------------------------
-# LinkBudget
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class LinkBudget:
-    """
-    A relative dB report for one ray: how much the ionosphere focused or
-    defocused it (ray-tube area, via the tangent map), how much power
-    absorption cost it, and how much coherence it lost to small-scale
-    scattering -- combined into `total_db`.
-
-    This is RELATIVE only (see link_budget.py): there's no transmitter
-    EIRP, antenna gain, or receiver sensitivity model anywhere in
-    Hamilton, so getting from `total_db` to an actual received power is
-    on you. `focusing_gain_db` (and therefore `total_db`) is None if the
-    ray didn't land -- there's no receiver, and no ray tube to measure,
-    for a ray that escaped or ran out of budget.
-
-    `ray` is the full underlying RayPath (with its tangent map attached),
-    for anything not surfaced here directly.
-    """
-
-    landed: bool
-    escaped: bool
-    ground_range_km: float
-
-    focusing_gain_db: Optional[float]
-    absorption_db: float
-    coherence_loss_db: float
-    total_db: Optional[float]
-
-    sigma_phi2: float
-    coherent_fraction: float
-
-    ray: RayPath
-
-    def __str__(self) -> str:
-        foc = f"{self.focusing_gain_db:+.2f} dB" if self.focusing_gain_db is not None else "n/a"
-        tot = f"{self.total_db:+.2f} dB" if self.total_db is not None else "n/a"
-        return (
-            f"LinkBudget({self.ray.frequency_mhz:g} MHz, {self.ray.mode}-mode, "
-            f"el={self.ray.elevation_deg:g}deg): {'landed' if self.landed else 'did not land'}, "
-            f"{self.ground_range_km:.1f} km\n"
-            f"  focusing gain  : {foc}\n"
-            f"  absorption     : -{self.absorption_db:.2f} dB\n"
-            f"  coherence loss : -{self.coherence_loss_db:.2f} dB\n"
-            f"  total          : {tot}  (relative only -- see class docstring)"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Link
 # ---------------------------------------------------------------------------
 
 class Link:
     """
-    An HF transmitter: a fixed place and moment in time, ready to trace
-    rays at whatever launch angles (and, per call if you like, frequency
-    or mode) you ask for.
+    An HF transmitter: a fixed place and moment in time, ready to trace rays at whatever launch angles (and, per
+    call, frequency or mode) you ask for, and to give their budget, their HiCIRF stochastic channel and their
+    PHaRLAP-style figures.
 
-    Construction does the expensive part once: an E-CHAIM+IRI-2020
-    electron-density patch and an IGRF-13 field patch, both centred on
-    (lat_deg, lon_deg) and sized generously enough (see max_path_km,
-    max_nhops) to cover every ray you'll go on to trace. Everything after
-    that -- trace(), scatter(), link_budget(), the sweep_*() helpers --
-    reuses that same patch and is correspondingly cheap.
+    Construction does the expensive part once: an E-CHAIM + IRI-2020 electron-density patch and an IGRF field patch,
+    centred on (lat_deg, lon_deg) and sized (max_path_km x max_nhops) to cover every ray you will trace.
 
     Parameters
     ----------
@@ -345,48 +367,40 @@ class Link:
     alt_m : float
         Transmitter altitude above the WGS84 ellipsoid (metres). Default 0.
     frequency_mhz : float
-        Default carrier frequency (MHz). Override per call via the
-        `frequency_mhz=` argument of trace()/scatter()/link_budget() --
-        cheap, since it's the ionosphere/field query that's expensive,
-        not building a Ray for a new frequency.
+        Default carrier frequency (MHz); every method takes `frequency_mhz=` to override it per call (cheap: only a
+        new Ray is built, the patch is reused).
     dt : datetime or None
-        UTC date/time -- determines solar/geomagnetic indices, season,
-        and local time per longitude for both background models. Default:
-        now (UTC). Pass this explicitly for reproducible results.
-    mode : "O", "X", +1, or -1
-        Default magneto-ionic mode (Appleton-Hartree branch). Override
-        per call the same way as frequency_mhz.
-    max_path_km : float
-        The longest per-hop path length you intend to trace. Sizes the
-        ionosphere/field patch (along with max_nhops) -- calls to
-        trace()/scatter()/link_budget() default to this, and may use a
-        *smaller* max_path_km, but asking for a longer one than the patch
-        was built for will silently run past its edge (Ne/B both fall
-        back to boundary values there, which is not what you want).
-        Default 2000 km.
-    max_nhops : int
-        The most ground bounces you intend to request in a single trace()
-        call. Used only to size the patch (multiplied against
-        max_path_km). Default 1.
+        UTC date and time: solar and geomagnetic indices, season, local time. Default: now (UTC). Pass it explicitly
+        for reproducible results.
+    mode : "O", "X", +1 or -1
+        Default magneto-ionic mode; override per call with `mode=`. Stored as "O" or "X".
+    max_path_km, max_nhops : float, int
+        The longest per-hop path and the most hops you intend to trace; they size the patch. A ray may use less;
+        a longer one runs past the patch edge (density and field fall back to boundary values). Defaults 2000 km, 1.
+        Note: E-CHAIM has been seen to crash building patches wider than about 60 deg (roughly max_path_km x
+        max_nhops > 2500 km at 57 deg latitude).
     use_echaim : bool
-        Prefer E-CHAIM over IRI-2020 wherever E-CHAIM is valid (AACGM
-        geomagnetic latitude >= 45 degrees); see ionosphere.py. Default
-        True.
+        Prefer E-CHAIM over IRI-2020 where it is valid (AACGM latitude >= 45 deg). Default True.
     n_ang, dr_km, dang_deg : int, float, float
-        Ionosphere query/grid resolution -- see ionosphere.py /
-        main.py::build_ionosphere_for_ray. Defaults 15, 2.0, 1.0.
+        Ionosphere query and grid resolution (geophysics/ionosphere.py). Defaults 15, 2.0, 1.0.
     igrf_n_ang, igrf_n_r : int
-        IGRF query grid resolution -- see igrf.py. Defaults 5, 5.
-    xi_rms, L0_km, p_index, axial_ratio : float
-        Default field-aligned irregularity spectrum, used by scatter()
-        and link_budget() (mc_scattering.py's IrregularitySpectrum).
-        Defaults: 5e-3 (quiet-to-moderate), 5 km, 4.0, 10.0.
-    absorption_model : str or callable(alt_km) -> nu_eff
-        Collision-frequency profile for absorption -- see absorption.py.
-        Default "default" (illustrative D/E-region profile).
+        IGRF query grid resolution (geophysics/igrf.py). Defaults 5, 5.
+    irregularity : core.inputs.IrregularityInputs, optional
+        The irregularity inputs of the HiCIRF channel when no irregularity_model / drift_model is given: xi, L0,
+        p, the two axial ratios, the drift and its spread. Default: IrregularityInputs() (placeholders).
+    xi_rms, L0_km, p_index, axial_ratio : float, optional
+        Shortcuts that override single fields of `irregularity` (axial_ratio sets both axial ratios). They also
+        define the spectrum of the deprecated scatter().
+    irregularity_model, drift_model : environment.IrregularityModel / DriftModel, optional
+        Position- and time-varying models (e.g. geophysics.wbmod.CrudeWBMOD, geophysics.plasma_drift.WBMODStyleDrift),
+        queried per ionospheric sample as model.at(r_ecef, dt). When given they replace the corresponding inputs.
+    coarsen_elevation_deg : float, optional
+        Place a phase screen only every this many degrees of ray-direction change (HiCIRF paragraph 17 uses 5).
+        Default None: one screen per ionospheric sample.
+    absorption_model : str or callable(alt_km) -> nu
+        Collision-frequency profile for absorption (raytracing/absorption.py). Default "default" (illustrative).
     verbose : bool
-        Print progress (ionosphere/field build, per-ray scatter progress)
-        to stdout. Default True.
+        Print progress (ionosphere and field build, scatter progress). Default True.
     """
 
     def __init__(
@@ -397,7 +411,7 @@ class Link:
         *,
         frequency_mhz: float,
         dt: Optional[datetime] = None,
-        mode: Union[str, int] = "O",
+        mode: Mode = "O",
         max_path_km: float = 2000.0,
         max_nhops: int = 1,
         use_echaim: bool = True,
@@ -406,11 +420,15 @@ class Link:
         dang_deg: float = 1.0,
         igrf_n_ang: int = 5,
         igrf_n_r: int = 5,
-        xi_rms: float = 5e-3,
-        L0_km: float = 5.0,
-        p_index: float = 4.0,
-        axial_ratio: float = 10.0,
-        absorption_model: str = "default",
+        irregularity: Optional[IrregularityInputs] = None,
+        xi_rms: Optional[float] = None,
+        L0_km: Optional[float] = None,
+        p_index: Optional[float] = None,
+        axial_ratio: Optional[float] = None,
+        irregularity_model: Optional[environment.IrregularityModel] = None,
+        drift_model: Optional[environment.DriftModel] = None,
+        coarsen_elevation_deg: Optional[float] = None,
+        absorption_model: Union[str, Callable] = "default",
         verbose: bool = True,
     ):
         if not (-90.0 <= lat_deg <= 90.0):
@@ -421,49 +439,74 @@ class Link:
             raise ValueError(f"max_path_km must be positive -- got {max_path_km}")
         if max_nhops < 1:
             raise ValueError(f"max_nhops must be >= 1 -- got {max_nhops}")
-        _normalize_mode(mode)  # validate early
 
         self.lat_deg = float(lat_deg)
         self.lon_deg = float(lon_deg)
         self.alt_m = float(alt_m)
         self.frequency_mhz = float(frequency_mhz)
         self.dt = dt if dt is not None else datetime.now(timezone.utc)
-        self.mode = mode
+        self.mode = _normalize_mode(mode)[1]
         self.max_path_km = float(max_path_km)
         self.max_nhops = int(max_nhops)
         self.use_echaim = use_echaim
         self.absorption_model = absorption_model
-        self.xi_rms, self.L0_km = xi_rms, L0_km
-        self.p_index, self.axial_ratio = p_index, axial_ratio
+
+        overrides = {}
+        if xi_rms is not None:
+            overrides["xi"] = float(xi_rms)
+        if L0_km is not None:
+            overrides["L0_m"] = float(L0_km) * 1e3
+        if p_index is not None:
+            overrides["p"] = float(p_index)
+        if axial_ratio is not None:
+            overrides.update(axial_ratio_B=float(axial_ratio), axial_ratio_sheet=float(axial_ratio))
+        self.irregularity = dataclasses.replace(irregularity or IrregularityInputs(), **overrides)
+        self.irregularity_model = irregularity_model
+        self.drift_model = drift_model
+        self.coarsen_elevation_deg = coarsen_elevation_deg
         self.verbose = verbose
 
         self.r0 = latlon_to_xyz_m(self.lat_deg, self.lon_deg, self.alt_m)
         self._up, self._north, self._east = _enu_frame(self.lat_deg, self.lon_deg)
 
-        # Placeholder launch direction ("up") for sizing the patch: for a
-        # ground/near-ground transmitter the ray always starts INSIDE the
-        # ionosphere grid (build_ionosphere_for_ray's simpler branch),
-        # where the resulting patch is centred on the transmitter and
-        # sized from max_path_m alone -- so which direction is passed
-        # here doesn't affect the result, only alt0_m being inside the
-        # grid does.
+        # A ground or near-ground transmitter starts inside the ionosphere grid, so build_ionosphere_for_ray centres
+        # the patch on it and sizes it from the path budget alone: the direction passed ("up") does not matter.
         if self.verbose:
-            print(f"[Link] building ionosphere + field patch for "
-                  f"{lat_deg:.2f}N {lon_deg:.2f}E, {self.dt.isoformat()} ...")
+            print(f"[Link] building ionosphere + field patch for {lat_deg:.2f}N {lon_deg:.2f}E, "
+                  f"{self.dt.isoformat()} ...")
         self._ionosphere: Ionosphere = build_ionosphere_for_ray(
             lat0_deg=self.lat_deg, lon0_deg=self.lon_deg, alt0_m=self.alt_m,
             direction=self._up, max_path_m=self.max_path_km * self.max_nhops * 1e3,
             dt=self.dt, n_ang=n_ang, use_echaim=self.use_echaim,
             dr_km=dr_km, dang_deg=dang_deg,
         )
-        self._field: IgrfField = build_igrf_for_ionosphere(
-            self._ionosphere, n_ang=igrf_n_ang, n_r=igrf_n_r,
-        )
+        self._field: IgrfField = build_igrf_for_ionosphere(self._ionosphere, n_ang=igrf_n_ang, n_r=igrf_n_r)
         if self.verbose:
             self._ionosphere.grid_info()
 
         self._ray_cache: dict[tuple[float, int], Ray] = {}
         self._spectrum_cache: dict[float, IrregularitySpectrum] = {}
+
+    # Scalar views of the irregularity inputs (also the spectrum of the deprecated scatter()).
+    @property
+    def xi_rms(self) -> float:
+        return self.irregularity.xi
+
+    @property
+    def L0_km(self) -> float:
+        return self.irregularity.L0_m / 1e3
+
+    @property
+    def p_index(self) -> float:
+        return self.irregularity.p
+
+    @property
+    def axial_ratio(self) -> float:
+        return self.irregularity.axial_ratio_B
+
+    def __repr__(self) -> str:
+        return (f"Link({self.lat_deg:.2f}, {self.lon_deg:.2f}, frequency_mhz={self.frequency_mhz:g}, "
+                f"mode={self.mode!r}, dt={self.dt.isoformat()!r})")
 
     # ------------------------------------------------------------------
     # Internals
@@ -477,273 +520,61 @@ class Link:
         d = np.cos(el) * horiz + np.sin(el) * self._up
         return d / np.linalg.norm(d)
 
-    def _resolve_ray(self, frequency_mhz: Optional[float], mode: Optional[Union[str, int]]) -> Ray:
+    def _frequency(self, frequency_mhz: Optional[float]) -> float:
         freq = self.frequency_mhz if frequency_mhz is None else float(frequency_mhz)
         if freq <= 0.0:
             raise ValueError(f"frequency_mhz must be positive -- got {freq}")
+        return freq
+
+    def _resolve_ray(self, frequency_mhz: Optional[float], mode: Optional[Mode]) -> Ray:
+        freq = self._frequency(frequency_mhz)
         mode_int, _ = _normalize_mode(self.mode if mode is None else mode)
         key = (freq, mode_int)
         if key not in self._ray_cache:
-            omega = 2.0 * np.pi * freq * 1e6
-            self._ray_cache[key] = Ray(
-                omega=omega, MODE=mode_int,
-                electron_density=self._ionosphere.electron_density_xyz_m,
-                B_field=self._field.B_vec_xyz_m,
-            )
+            self._ray_cache[key] = Ray(omega=2.0 * np.pi * freq * 1e6, MODE=mode_int,
+                                       electron_density=self._ionosphere.electron_density_xyz_m,
+                                       B_field=self._field.B_vec_xyz_m)
         return self._ray_cache[key]
 
     def _resolve_spectrum(self, frequency_mhz: Optional[float]) -> IrregularitySpectrum:
-        freq = self.frequency_mhz if frequency_mhz is None else float(frequency_mhz)
+        freq = self._frequency(frequency_mhz)
         if freq not in self._spectrum_cache:
-            spec = IrregularitySpectrum(
-                xi_rms=self.xi_rms, L0_m=self.L0_km * 1e3,
-                p_index=self.p_index, axial_ratio=self.axial_ratio,
-            )
-            k0 = 2.0 * np.pi * freq * 1e6 / C
-            spec.tabulate(k0=k0)
+            spec = IrregularitySpectrum(xi_rms=self.xi_rms, L0_m=self.L0_km * 1e3, p_index=self.p_index,
+                                        axial_ratio=self.axial_ratio)
+            spec.tabulate(k0=2.0 * np.pi * freq * 1e6 / C)
             self._spectrum_cache[freq] = spec
         return self._spectrum_cache[freq]
 
     def _path_budget_m(self, max_path_km: Optional[float]) -> float:
         return (self.max_path_km if max_path_km is None else float(max_path_km)) * 1e3
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def _drift_ecef(self) -> np.ndarray:
+        ve, vn = self.irregularity.drift_east_north_mps
+        return ve * self._east + vn * self._north
 
-    def trace(
-        self,
-        elevation_deg: float,
-        azimuth_deg: float = 0.0,
-        *,
-        max_path_km: Optional[float] = None,
-        nhops: int = 1,
-        method: str = "fixed",
-        frequency_mhz: Optional[float] = None,
-        mode: Optional[Union[str, int]] = None,
-        absorption: bool = True,
-        group_path: bool = True,
-        phase_variance: bool = False,
-        tangent_map: bool = False,
-        ds_step_km: float = 2.0,
-    ) -> RayPath:
-        """
-        Trace one deterministic ray.
+    def _screens(self, samples: RaySamples, ray: Ray):
+        """Phase screens of a traced leg (stochastic.leg_screens), from this Link's irregularity inputs or models."""
+        irr = self.irregularity
+        return screens_for_leg(samples, ray, xi=irr.xi, L0=irr.L0_m, p=irr.p, a=irr.axial_ratio_B,
+                               b=irr.axial_ratio_sheet, v_d=self._drift_ecef(), sigma_v_frac=irr.sigma_v_frac,
+                               irregularity_model=self.irregularity_model, drift_model=self.drift_model, t=self.dt,
+                               coarsen_elevation_deg=self.coarsen_elevation_deg)
 
-        elevation_deg, azimuth_deg : launch angles above the local
-            horizontal and clockwise from true north, degrees.
-        max_path_km, nhops : path budget per hop, and how many ground
-            bounces to allow (specular reflection off the true WGS84
-            ellipsoid). Default max_path_km is this Link's own
-            max_path_km; don't exceed what the Link was built to cover
-            (see Link's max_path_km/max_nhops docs).
-        method : "fixed" (default -- fixed-step RK4, fast, what the
-            Monte Carlo ensemble also uses) or "adaptive" (solve_ivp
-            RK45 with tight error control -- slower, and required for
-            tangent_map=True; requested automatically if you set
-            tangent_map=True without also setting method="adaptive").
-        frequency_mhz, mode : override this Link's defaults for just
-            this ray (cheap -- reuses the already-built ionosphere/field).
-        absorption, group_path : include non-deviative D/E-region
-            absorption (absorption.py) and the group-path/group-index
-            calculation (raytracer.py) -- both on by default, each is a
-            real (if small) per-step cost if you don't need them.
-        phase_variance : accumulate sigma_phi2, the deterministic
-            phase-variance rate from the same irregularity spectrum
-            scatter() draws kicks from -- gives you RayPath.sigma_phi2
-            without running a full ensemble. Off by default.
-        tangent_map : carry the 6x6 ray-tube tangent map (sensitivity of
-            landing state to launch angle) -- gives you
-            RayPath.tangent_map. This is what link_budget() uses
-            internally for focusing_gain_db; call link_budget() directly
-            if that's what you actually want. Off by default (real cost:
-            forces method="adaptive" and a second integration pass).
-        ds_step_km : integration step for method="fixed" only.
+    def _leg_screens_and_channel(self, ray: RayPath, options: Optional[ChannelOptions] = None):
+        """(ScreenSet, ChannelParams) of a traced ray, from its own samples."""
+        if ray.samples is None:
+            raise ValueError("this RayPath has no per-step samples (only rays from Link.trace() and the sweep_* "
+                             "methods have them)")
+        Pg = np.asarray(ray.samples.Pg, dtype=float)
+        if not np.all(np.isfinite(Pg)) or not np.any(np.diff(Pg) > 0.0):
+            raise ValueError("the channel needs the group path: trace the ray with group_path=True")
+        scr = self._screens(ray.samples, self._resolve_ray(ray.frequency_mhz, ray.mode))
+        return scr, channel_parameters(scr, ray.frequency_mhz * 1e6, options or ChannelOptions())
 
-        Returns
-        -------
-        RayPath
-        """
-        ray = self._resolve_ray(frequency_mhz, mode)
-        spectrum = self._resolve_spectrum(frequency_mhz) if phase_variance else None
-        tracer = RayTracer(ray, spectrum=spectrum, ds_step_m=ds_step_km * 1e3,
-                            absorption_model=self.absorption_model)
-
-        if tangent_map and method != "adaptive":
-            method = "adaptive"
-
-        u0 = self._direction(elevation_deg, azimuth_deg)
-        result = tracer.trace(
-            self.r0, u0, self._path_budget_m(max_path_km),
-            nhops=nhops, method=method, carry_tangent_map=tangent_map,
-            compute_group_path=group_path, compute_absorption=absorption,
-            compute_phase_variance=phase_variance,
-        )
-        _, mode_label = _normalize_mode(self.mode if mode is None else mode)
-        freq = self.frequency_mhz if frequency_mhz is None else frequency_mhz
-        return _build_ray_path(result, frequency_mhz=freq, mode=mode_label,
-                                elevation_deg=elevation_deg, azimuth_deg=azimuth_deg)
-
-    def scatter(
-        self,
-        elevation_deg: float,
-        azimuth_deg: float = 0.0,
-        *,
-        n_rays: int = 200,
-        max_path_km: Optional[float] = None,
-        nhops: int = 1,
-        frequency_mhz: Optional[float] = None,
-        mode: Optional[Union[str, int]] = None,
-        ds_step_km: float = 2.0,
-        seed: Optional[int] = None,
-        verbose: Optional[bool] = None,
-    ) -> ScatterResult:
-        """
-        Trace a Monte Carlo ensemble of n_rays scattered rays (Langevin
-        kicks drawn from this Link's irregularity spectrum -- see
-        mc_scattering.py) around the deterministic ray for this launch
-        geometry, plus that deterministic ray itself as `.reference`.
-
-        seed : RNG seed, for a reproducible ensemble. None (default) is
-            fresh randomness each call.
-        verbose : print "ray i/n_rays" progress every 25 rays. Defaults
-            to this Link's own verbose setting.
-
-        Returns
-        -------
-        ScatterResult
-        """
-        ray = self._resolve_ray(frequency_mhz, mode)
-        spectrum = self._resolve_spectrum(frequency_mhz)
-        mc = MCScatteringTracer(ray, spectrum, ds_step_m=ds_step_km * 1e3,
-                                 seed=seed, record_every=5)
-
-        u0 = self._direction(elevation_deg, azimuth_deg)
-        budget_m = self._path_budget_m(max_path_km)
-        verbose = self.verbose if verbose is None else verbose
-
-        det = mc.trace(self.r0, u0, budget_m, scatter=False, nhops=nhops)
-        results = mc.ensemble(self.r0, u0, n_rays=n_rays, max_path_m=budget_m,
-                               nhops=nhops, verbose_every=(25 if verbose else 0))
-        summ = mc.summarize(results, self.r0)
-
-        _, mode_label = _normalize_mode(self.mode if mode is None else mode)
-        freq = self.frequency_mhz if frequency_mhz is None else frequency_mhz
-
-        def _rp(res) -> RayPath:
-            return RayPath(
-                frequency_mhz=freq, mode=mode_label,
-                elevation_deg=elevation_deg, azimuth_deg=azimuth_deg,
-                landed=res.landed, escaped=res.escaped, hops_completed=res.hops_completed,
-                path=res.path, arc_length=res.s_path, bounce_points=res.bounce_points,
-                launch_point=res.path[0], final_point=res.r_final, final_direction=res.u_final,
-                ground_range_km=res.ground_range_total_m / 1e3,
-                arc_length_km=res.s_total / 1e3,
-                phase_path_km=res.phase_path_total / 1e3,
-                group_path_km=res.group_path_total / 1e3,
-                group_delay_ms=1e3 * res.group_path_total / C,
-                absorption_db=res.absorption_db_total,
-                arrival_elevation_deg=(_arrival_elevation_deg(res.r_final, res.u_final) if res.landed else None),
-                sigma_phi2=(res.sigma_phi2 if res.sigma_phi2 else None),
-                tangent_map=None,
-            )
-
-        reference = _rp(det)
-        if summ.get("n_landed", 0) == 0:
-            return ScatterResult(
-                reference=reference, rays=[], n_rays=n_rays, n_landed=0,
-                range_mean_km=float("nan"), range_std_km=float("nan"), cross_range_std_km=float("nan"),
-                elevation_mean_deg=float("nan"), elevation_std_deg=float("nan"),
-                group_path_mean_km=float("nan"), group_delay_spread_ms=float("nan"),
-                absorption_mean_db=float("nan"), absorption_std_db=float("nan"),
-                sigma_phi2_mean=float("nan"), coherent_fraction=float("nan"),
-            )
-
-        landed_rays = [_rp(r) for r in results if r.landed]
-        return ScatterResult(
-            reference=reference, rays=landed_rays, n_rays=n_rays, n_landed=summ["n_landed"],
-            range_mean_km=summ["range_mean_km"], range_std_km=summ["range_std_km"],
-            cross_range_std_km=summ["cross_std_km"],
-            elevation_mean_deg=summ["elev_mean_deg"], elevation_std_deg=summ["elev_std_deg"],
-            group_path_mean_km=summ["group_path_mean_km"],
-            group_delay_spread_ms=1e3 * summ["group_path_std_km"] * 1e3 / C,
-            absorption_mean_db=summ["absorption_db_mean"], absorption_std_db=summ["absorption_db_std"],
-            sigma_phi2_mean=summ["sigma_phi2_mean"], coherent_fraction=summ["coherent_fraction"],
-        )
-
-    def link_budget(
-        self,
-        elevation_deg: float,
-        azimuth_deg: float = 0.0,
-        *,
-        max_path_km: Optional[float] = None,
-        nhops: int = 1,
-        frequency_mhz: Optional[float] = None,
-        mode: Optional[Union[str, int]] = None,
-    ) -> LinkBudget:
-        """
-        Relative dB link-budget report for one ray: focusing gain (from
-        the ray-tube tangent map), absorption, and coherence loss,
-        combined into total_db. See LinkBudget's docstring for what
-        "relative" means here. Runs a single adaptive trace with the
-        tangent map, group/phase path, absorption, and phase variance
-        all enabled -- see link_budget.py::compute_receiver_statistics.
-
-        Returns
-        -------
-        LinkBudget
-        """
-        ray = self._resolve_ray(frequency_mhz, mode)
-        spectrum = self._resolve_spectrum(frequency_mhz)
-        tracer = RayTracer(ray, spectrum=spectrum, absorption_model=self.absorption_model)
-
-        u0 = self._direction(elevation_deg, azimuth_deg)
-        stats = compute_receiver_statistics(tracer, self.r0, u0, self._path_budget_m(max_path_km),
-                                             nhops=nhops)
-
-        _, mode_label = _normalize_mode(self.mode if mode is None else mode)
-        freq = self.frequency_mhz if frequency_mhz is None else frequency_mhz
-        ray_path = _build_ray_path(stats.result, frequency_mhz=freq, mode=mode_label,
-                                    elevation_deg=elevation_deg, azimuth_deg=azimuth_deg)
-        return LinkBudget(
-            landed=stats.landed, escaped=stats.escaped,
-            ground_range_km=stats.ground_range_total_m / 1e3,
-            focusing_gain_db=stats.focusing_gain_db,
-            absorption_db=stats.absorption_db,
-            coherence_loss_db=stats.coherence_loss_db,
-            total_db=stats.total_db,
-            sigma_phi2=stats.sigma_phi2, coherent_fraction=stats.coherent_fraction,
-            ray=ray_path,
-        )
-
-    def sweep_elevation(self, elevations_deg: Sequence[float], azimuth_deg: float = 0.0,
-                         **trace_kwargs) -> list[RayPath]:
-        """trace() at each of several elevation angles. **trace_kwargs forwarded as-is."""
-        return [self.trace(el, azimuth_deg, **trace_kwargs) for el in elevations_deg]
-
-    def sweep_azimuth(self, elevation_deg: float, azimuths_deg: Sequence[float],
-                       **trace_kwargs) -> list[RayPath]:
-        """trace() at each of several azimuths, fixed elevation. **trace_kwargs forwarded as-is."""
-        return [self.trace(elevation_deg, az, **trace_kwargs) for az in azimuths_deg]
-
-    def sweep_frequency(self, elevation_deg: float, frequencies_mhz: Sequence[float],
-                         azimuth_deg: float = 0.0, **trace_kwargs) -> list[RayPath]:
-        """
-        trace() at each of several frequencies, fixed launch geometry.
-        Reuses this Link's ionosphere/field patch -- only a new Ray (cheap)
-        is built per frequency. **trace_kwargs forwarded as-is.
-        """
-        return [self.trace(elevation_deg, azimuth_deg, frequency_mhz=f, **trace_kwargs)
-                for f in frequencies_mhz]
-
-    def plot(self, *rays, highlight=None, title: Optional[str] = None, **kwargs):
-        """
-        Interactive 3-D plot (plotly) of one or more RayPath/ScatterResult
-        objects (or bare lists of them). A ScatterResult contributes its
-        reference ray (as the highlight, unless you pass your own) plus
-        its full ensemble. See visualization.plot_ray for other kwargs
-        (show_bounce_points, ensemble_stride, ...).
-        """
+    @staticmethod
+    def _flatten_rays(rays, highlight):
+        """RayPaths from RayPath / ScatterResult / list arguments; a ScatterResult's reference is the highlight
+        unless one is given."""
         flat: list[RayPath] = []
         for r in rays:
             if isinstance(r, ScatterResult):
@@ -755,32 +586,281 @@ class Link:
                 flat.extend(r)
             else:
                 flat.append(r)
-        return _plot_ray(flat, highlight=highlight, title=title, **kwargs)
+        return flat, highlight
 
-    def grid_info(self) -> None:
-        """Print a summary of the ionosphere patch this Link built (see Ionosphere.grid_info)."""
-        self._ionosphere.grid_info()
+    # ------------------------------------------------------------------
+    # Rays
+    # ------------------------------------------------------------------
+
+    def trace(
+        self,
+        elevation_deg: float,
+        azimuth_deg: float = 0.0,
+        *,
+        nhops: int = 1,
+        max_path_km: Optional[float] = None,
+        frequency_mhz: Optional[float] = None,
+        mode: Optional[Mode] = None,
+        absorption: bool = True,
+        group_path: bool = True,
+        phase_variance: bool = False,
+        ds_step_km: float = 2.0,
+    ) -> RayPath:
+        """
+        Trace one ray (fixed-step RK4 with step rejection, raytracing.batch.BatchTracer).
+
+        elevation_deg, azimuth_deg : launch angles above the local horizontal and clockwise from true north, degrees.
+        nhops, max_path_km : number of hops (specular ground bounces on the WGS84 ellipsoid) and the path budget per
+            hop (default: the Link's max_path_km).
+        frequency_mhz, mode : override this Link's defaults for this ray only.
+        absorption : non-deviative absorption (raytracing/absorption.py), on by default.
+        group_path : the exact group path P' (spec §2.7), on by default; Link.channel() needs it.
+        phase_variance : also fill RayPath.sigma_phi2, the phase variance of the leg's phase screens (the same as
+            Link.channel(ray).sigma_phi2).
+        ds_step_km : integration step.
+        """
+        ray = self._resolve_ray(frequency_mhz, mode)
+        tracer = BatchTracer(ray, ds_m=ds_step_km * 1e3, absorption_model=self.absorption_model)
+        u0 = self._direction(elevation_deg, azimuth_deg)
+        res = tracer.trace(self.r0, u0[None], self._path_budget_m(max_path_km), nhops=nhops,
+                           want_group=group_path, want_absorption=absorption, record_states=True)
+        samples = samples_from_record(tracer, res.records[0], transport=True)
+        sigma_phi2 = float(np.sum(self._screens(samples, ray).sigma2)) if phase_variance else None
+        return _ray_path_from_batch(res, samples, frequency_mhz=self._frequency(frequency_mhz),
+                                    mode=_normalize_mode(self.mode if mode is None else mode)[1],
+                                    elevation_deg=elevation_deg, azimuth_deg=azimuth_deg, sigma_phi2=sigma_phi2)
+
+    def sweep_elevation(self, elevations_deg: Sequence[float], azimuth_deg: float = 0.0,
+                        **trace_kwargs) -> list[RayPath]:
+        """trace() at each of several elevations (a PHaRLAP fan). **trace_kwargs go to trace()."""
+        return [self.trace(el, azimuth_deg, **trace_kwargs) for el in elevations_deg]
+
+    def sweep_azimuth(self, elevation_deg: float, azimuths_deg: Sequence[float], **trace_kwargs) -> list[RayPath]:
+        """trace() at each of several azimuths, fixed elevation. **trace_kwargs go to trace()."""
+        return [self.trace(elevation_deg, az, **trace_kwargs) for az in azimuths_deg]
+
+    def sweep_frequency(self, elevation_deg: float, frequencies_mhz: Sequence[float], azimuth_deg: float = 0.0,
+                        **trace_kwargs) -> list[RayPath]:
+        """trace() at each of several frequencies, fixed launch geometry (only a new Ray per frequency; the patch
+        is reused). **trace_kwargs go to trace()."""
+        return [self.trace(elevation_deg, azimuth_deg, frequency_mhz=f, **trace_kwargs) for f in frequencies_mhz]
+
+    # ------------------------------------------------------------------
+    # Budget
+    # ------------------------------------------------------------------
+
+    def link_budget(
+        self,
+        elevation_deg: float,
+        azimuth_deg: float = 0.0,
+        *,
+        nhops: int = 1,
+        max_path_km: Optional[float] = None,
+        frequency_mhz: Optional[float] = None,
+        mode: Optional[Mode] = None,
+        Pt_dBW: Optional[float] = None,
+        Gt_dB: float = 0.0,
+        Gr_dB: float = 0.0,
+    ) -> LinkBudget:
+        """
+        One-way dB budget of one leg (spec §6.2-§6.4): flux-tube focusing with the caustic cap (landing mini-fan,
+        propagation/legs.py), absorption, ground losses and the 3.01 dB polarization loss. No coherence term. Pass
+        Pt_dBW (and Gt_dB, Gr_dB) for an absolute received power.
+        """
+        ray = self._resolve_ray(frequency_mhz, mode)
+        tracer = BatchTracer(ray, absorption_model=self.absorption_model)
+        bud = one_way_budget(tracer, self.r0, self._up, self._north, self._east, elevation_deg, azimuth_deg,
+                             self._path_budget_m(max_path_km), nhops=nhops, Pt_dBW=Pt_dBW, Gt_dB=Gt_dB,
+                             Gr_dB=Gr_dB)
+        ray_path = self.trace(elevation_deg, azimuth_deg, max_path_km=max_path_km, nhops=nhops,
+                              frequency_mhz=frequency_mhz, mode=mode)
+        total = None
+        if bud.landed and bud.focusing_gain_db is not None:
+            total = bud.focusing_gain_db - bud.total_loss_db
+        return LinkBudget(
+            landed=bud.landed, ground_range_km=bud.ground_range_m / 1e3, delay_ms=bud.delay_s * 1e3,
+            doppler_hz=bud.doppler_hz, focusing_gain_db=bud.focusing_gain_db, caustic=bud.caustic,
+            absorption_db=bud.absorption_db, ground_loss_db=bud.ground_loss_db,
+            polarization_loss_db=bud.polarization_loss_db, total_db=total, received_dBW=bud.received_dBW,
+            ray=ray_path,
+        )
+
+    # ------------------------------------------------------------------
+    # HiCIRF channel
+    # ------------------------------------------------------------------
+
+    def channel(self, ray: RayPath, *, options: Optional[ChannelOptions] = None) -> ChannelParams:
+        """
+        The HiCIRF stochastic channel of a traced ray's leg (spec §10, Algorithm 5): its phase screens from this
+        Link's irregularity inputs or models (stochastic/leg_screens.py), then sigma_phi^2, the coherence ellipse
+        (l_x, l_y), tau_o, the apparent velocity, C_xt, C_yt, the mean excess delay, omega_coh, the wander alpha,
+        S4 and the Rician split (A_c, A_d). Uses the ray's own samples: the channel is that of this very ray.
+        """
+        return self._leg_screens_and_channel(ray, options)[1]
+
+    def leg_channel(self, elevation_deg: float, azimuth_deg: float = 0.0, *, nhops: int = 1,
+                    max_path_km: Optional[float] = None, frequency_mhz: Optional[float] = None,
+                    mode: Optional[Mode] = None, options: Optional[ChannelOptions] = None) -> ChannelParams:
+        """channel() of the ray traced at these launch angles (a shortcut for channel(trace(...)))."""
+        ray = self.trace(elevation_deg, azimuth_deg, nhops=nhops, max_path_km=max_path_km,
+                         frequency_mhz=frequency_mhz, mode=mode, absorption=False)
+        return self.channel(ray, options=options)
+
+    # ------------------------------------------------------------------
+    # Figures (plotting/)
+    # ------------------------------------------------------------------
+
+    def plot(self, *rays, highlight: Optional[RayPath] = None, title: Optional[str] = None, hicirf: bool = True,
+             background: bool = True, options: Optional[ChannelOptions] = None, **kwargs):
+        """
+        PHaRLAP-style range-height figure (matplotlib Figure; plotting.figures.ray_slice_figure): the plasma
+        frequency of this Link's ionosphere along the bearing of the highlighted (else first) ray, the rays over it
+        in PHaRLAP's curved-Earth frame, and a UTC / frequency / bearing note.
+
+        rays : RayPath, ScatterResult, or lists of them. A single ray is highlighted (red, with its Tx elevation);
+            with several, pass highlight= to pick one, otherwise they are drawn as a plain PHaRLAP fan.
+        hicirf : for the highlighted ray, draw its phase screens and its channel (channel(); options= are its
+            ChannelOptions). Skipped for rays without samples (Monte Carlo rays).
+        background : False leaves the slice empty.
+        Other kwargs go to ray_slice_figure: start_range, end_range, end_height, cmap ('MuellerMap', 'parula', ...),
+        startup=False for MATLAB's factory style, fig_width_px, ...
+        """
+        from plotting.figures import ray_slice_figure
+
+        flat, highlight = self._flatten_rays(rays, highlight)
+        if not flat:
+            raise ValueError("nothing to plot: pass at least one RayPath")
+        if highlight is None and len(flat) == 1:
+            highlight = flat[0]
+        hic = None
+        if hicirf and highlight is not None and highlight.samples is not None:
+            try:
+                scr, P = self._leg_screens_and_channel(highlight, options)
+                hic = dict(samples=highlight.samples, screens=scr, channel=P, absorption_db=highlight.absorption_db)
+            except ValueError as exc:            # e.g. a ray that never enters the ionosphere has no screens
+                hic = dict(error=str(exc))
+        return ray_slice_figure(
+            flat, highlight=highlight, origin_ecef=self.r0, origin_lat=self.lat_deg, origin_lon=self.lon_deg,
+            density_geodetic=self._ionosphere.electron_density_geodetic if background else None,
+            utc=self.dt, hicirf=hic, title=title, **kwargs)
+
+    def plot_3d(self, *rays, title: Optional[str] = None, **kwargs):
+        """PHaRLAP's 3-D latitude/longitude/height figure of the rays (O-mode blue dots, X-mode red dots;
+        plotting.figures.rays_3d_figure). kwargs: zlim, startup, figsize, ..."""
+        from plotting.figures import rays_3d_figure
+
+        flat, _ = self._flatten_rays(rays, None)
+        return rays_3d_figure(flat, title=title, **kwargs)
+
+    def plot_scattering_function(self, ray: RayPath, *, options: Optional[ChannelOptions] = None, **kwargs):
+        """HiCIRF delay-Doppler scattering function of a traced ray's leg (from channel(ray);
+        plotting.figures.scattering_function_figure). kwargs: floor_db, cmap, startup, title, grid."""
+        from plotting.figures import scattering_function_figure
+
+        kwargs.setdefault("title", f"HiCIRF Scattering Function\n{ray.frequency_mhz:g} MHz {ray.mode}-mode, "
+                                   f"elevation {ray.elevation_deg:g}°, bearing {ray.azimuth_deg:g}°")
+        return scattering_function_figure(self.channel(ray, options=options), **kwargs)
+
+    def plot_html(self, *rays, highlight: Optional[RayPath] = None, title: Optional[str] = None, **kwargs):
+        """The interactive 3-D Plotly scene of the rays (plotting.plotly_3d.plot_ray); .write_html(path) saves it."""
+        from plotting.plotly_3d import plot_ray
+
+        flat, highlight = self._flatten_rays(rays, highlight)
+        return plot_ray(flat, highlight=highlight, title=title, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Environment
+    # ------------------------------------------------------------------
 
     @property
     def ionosphere(self) -> Ionosphere:
-        """The underlying E-CHAIM+IRI-2020 Ionosphere patch, for direct inspection/plotting."""
+        """The underlying E-CHAIM + IRI-2020 Ionosphere patch (geophysics/ionosphere.py)."""
         return self._ionosphere
 
     @property
     def magnetic_field(self) -> IgrfField:
-        """The underlying IGRF-13 field patch, for direct inspection."""
+        """The underlying IGRF field patch (geophysics/igrf.py)."""
         return self._field
 
-    def __repr__(self) -> str:
-        return (f"Link({self.lat_deg:.2f}, {self.lon_deg:.2f}, "
-                f"frequency_mhz={self.frequency_mhz:g}, mode={self.mode!r}, "
-                f"dt={self.dt.isoformat()!r})")
+    def electron_density_xyz_m(self, x, y, z):
+        """This Link's background electron density [m^-3] at ECEF metres, e.g. for
+        geophysics.wbmod.CrudeWBMOD(ne_column=link.electron_density_xyz_m), which integrates Ne^2 for eq. (5)."""
+        return self._ionosphere.electron_density_xyz_m(x, y, z)
 
+    def grid_info(self) -> None:
+        """Print a summary of the ionosphere patch this Link built (Ionosphere.grid_info)."""
+        self._ionosphere.grid_info()
 
-def _enu_frame(lat_deg: float, lon_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Local (up, north, east) unit vectors in ECEF, at a given geodetic (lat, lon)."""
-    lat_r, lon_r = np.deg2rad(lat_deg), np.deg2rad(lon_deg)
-    up = np.array([np.cos(lat_r) * np.cos(lon_r), np.cos(lat_r) * np.sin(lon_r), np.sin(lat_r)])
-    north = np.array([-np.sin(lat_r) * np.cos(lon_r), -np.sin(lat_r) * np.sin(lon_r), np.cos(lat_r)])
-    east = np.array([-np.sin(lon_r), np.cos(lon_r), 0.0])
-    return up, north, east
+    # ------------------------------------------------------------------
+    # Deprecated: Monte Carlo layer (decision D6)
+    # ------------------------------------------------------------------
+
+    def scatter(
+        self,
+        elevation_deg: float,
+        azimuth_deg: float = 0.0,
+        *,
+        n_rays: int = 200,
+        nhops: int = 1,
+        max_path_km: Optional[float] = None,
+        frequency_mhz: Optional[float] = None,
+        mode: Optional[Mode] = None,
+        ds_step_km: float = 2.0,
+        seed: Optional[int] = None,
+        verbose: Optional[bool] = None,
+    ) -> ScatterResult:
+        """
+        Deprecated (decision D6): a Monte Carlo ensemble of n_rays rays with Langevin kicks from the irregularity
+        spectrum (raytracing/mc_scattering.py) around the deterministic ray, which is `.reference`. Use channel()
+        for the stochastic channel of a leg.
+
+        seed : RNG seed for a reproducible ensemble; None is fresh randomness.
+        verbose : print progress every 25 rays; defaults to the Link's verbose.
+        """
+        warnings.warn("Link.scatter() runs the deprecated Monte Carlo layer (decision D6). Use Link.channel() for "
+                      "the stochastic channel of a leg.", DeprecationWarning, stacklevel=2)
+        ray = self._resolve_ray(frequency_mhz, mode)
+        mc = MCScatteringTracer(ray, self._resolve_spectrum(frequency_mhz), ds_step_m=ds_step_km * 1e3, seed=seed,
+                                record_every=5)
+        u0 = self._direction(elevation_deg, azimuth_deg)
+        budget_m = self._path_budget_m(max_path_km)
+        verbose = self.verbose if verbose is None else verbose
+
+        det = mc.trace(self.r0, u0, budget_m, scatter=False, nhops=nhops)
+        results = mc.ensemble(self.r0, u0, n_rays=n_rays, max_path_m=budget_m, nhops=nhops,
+                              verbose_every=(25 if verbose else 0))
+        summ = mc.summarize(results, self.r0)
+        mode_label = _normalize_mode(self.mode if mode is None else mode)[1]
+        freq = self._frequency(frequency_mhz)
+
+        def _rp(res) -> RayPath:
+            return RayPath(
+                frequency_mhz=freq, mode=mode_label, elevation_deg=elevation_deg, azimuth_deg=azimuth_deg,
+                landed=res.landed, escaped=res.escaped, hops_completed=res.hops_completed,
+                path=res.path, arc_length=res.s_path, bounce_points=res.bounce_points,
+                launch_point=res.path[0], final_point=res.r_final, final_direction=res.u_final,
+                ground_range_km=res.ground_range_total_m / 1e3, arc_length_km=res.s_total / 1e3,
+                phase_path_km=res.phase_path_total / 1e3, group_path_km=res.group_path_total / 1e3,
+                group_delay_ms=1e3 * res.group_path_total / C, absorption_db=res.absorption_db_total,
+                arrival_elevation_deg=(_arrival_elevation_deg(res.r_final, res.u_final) if res.landed else None),
+                sigma_phi2=(res.sigma_phi2 if res.sigma_phi2 else None),
+            )
+
+        reference = _rp(det)
+        nan = float("nan")
+        if summ.get("n_landed", 0) == 0:
+            return ScatterResult(
+                reference=reference, rays=[], n_rays=n_rays, n_landed=0, range_mean_km=nan, range_std_km=nan,
+                cross_range_std_km=nan, elevation_mean_deg=nan, elevation_std_deg=nan, group_path_mean_km=nan,
+                group_delay_spread_ms=nan, absorption_mean_db=nan, absorption_std_db=nan, sigma_phi2_mean=nan,
+                coherent_fraction=nan,
+            )
+        return ScatterResult(
+            reference=reference, rays=[_rp(r) for r in results if r.landed], n_rays=n_rays,
+            n_landed=summ["n_landed"], range_mean_km=summ["range_mean_km"], range_std_km=summ["range_std_km"],
+            cross_range_std_km=summ["cross_std_km"], elevation_mean_deg=summ["elev_mean_deg"],
+            elevation_std_deg=summ["elev_std_deg"], group_path_mean_km=summ["group_path_mean_km"],
+            group_delay_spread_ms=1e3 * summ["group_path_std_km"] * 1e3 / C,
+            absorption_mean_db=summ["absorption_db_mean"], absorption_std_db=summ["absorption_db_std"],
+            sigma_phi2_mean=summ["sigma_phi2_mean"], coherent_fraction=summ["coherent_fraction"],
+        )

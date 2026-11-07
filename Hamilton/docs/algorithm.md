@@ -184,6 +184,11 @@ $$
 The first term of $\dot{\mathbf u}$ is refraction by the density gradient; the second is
 refraction by the gradient of the geomagnetic field. Directionally, in an isotropic plasma
 $\dot{\mathbf r}\parallel\mathbf u$ and $\dot{\mathbf u}\parallel\nabla N_e$.
+**Sign (P0.1).** In the plasma branch the physical ray velocity is $\mathrm{MODE}\,(J\mathbf u-KY)$ with
+$\mathrm{MODE}=+1$ (O) or $-1$ (X), so the traced ray moves along the group velocity for both modes. The
+vacuum branch is not flipped (O and X coincide there). Without this factor X-mode rays moved against the
+group velocity (fixed in Phase 0; see §8.0).
+
 **▸ Code:** `Ray._haselgrove_physical_rhs`.
 
 ### 2.5 The vacuum branch and the numerically stable form
@@ -244,45 +249,41 @@ so all indexing is by fixed position.
 
 ### 2.8 Absorption
 
-Absorption is **non-deviative** (the same approach as PHaRLAP's "George" option): the ray is not
-altered by loss; loss is integrated along it afterwards. At each point the code re-solves the *same*
-quadratic (2) but with a complex, collision-damped density parameter (Budden 1961),
+Absorption is **non-deviative**: the ray is traced loss-free and loss is integrated along it
+afterwards. With the collisional Budden form of the angle Appleton–Hartree relation (spec eq. 4.1),
+the denominators carry $U=1-iZ$, $Z=\nu_{\rm eff}/\omega$ (not $X\to X/(1-iZ)$, which is wrong for
+$B\neq0$; §8.0). The amplitude coefficient is
 
 $$
-X\;\to\;\frac{X}{1-iZ},\qquad Z=\frac{\nu_{\rm eff}(h)}{\omega},
+\alpha_{\rm amp}=k_0\,|\mathrm{Im}\,n|\cos\alpha_{\rm rw},\qquad \cos\alpha_{\rm rw}=\hat u\cdot\hat s ,
 $$
 
-which makes $p=n^2$, and hence $n$, complex. Wave amplitude goes as $e^{-k_0\,\mathrm{Im}(n)\,s}$, so the
-**power** attenuation coefficient is
+and the one-way power loss in dB is $A_{\rm dB}=8.686\int\alpha_{\rm amp}\,ds$ (spec §7.3).
 
-$$
-\alpha=2k_0\,\mathrm{Im}\,n\ \ [\mathrm{Np/m}],\qquad
-A=\int\alpha\,ds,\qquad P(s)=P_0\,e^{-A}.
-$$
+**Sen–Wyller in the D region (spec §7.2, eq. 7.2).** For a Sen–Wyller collision frequency $\nu_m$
+(`nu_kind == "nu_m"`), below 100 km the coefficient is
+$\kappa_{\rm dB}=4.61\times10^{-5}N_e F(\nu_m/\omega')/\omega'$, with
+$F(x)=\langle xu/(1+x^2u^2)\rangle_u$, $\langle f\rangle_u=\int f\,u^{3/2}e^{-u}du/\Gamma(5/2)$, and
+$\omega'=\omega(1\pm Y|\cos\theta|)$ (upper sign O, lower X). Above 100 km the complex form is used with
+$\nu_{\rm eff}=\tfrac52\nu_m$. Limits: $F\to\tfrac52x$ (ν ≪ ω′) and $F\to\tfrac23/x$ (ν ≫ ω′), i.e.
+$\nu_{\rm eff}=\tfrac52\nu_m$ and $\tfrac32\nu_m$ (the 2.5 factor is the one that is often missed).
 
-(The sign of the square root is chosen so that $\mathrm{Im}\,n>0$ — the physically damped branch
-for the $e^{-i(kz-\omega t)}$ convention. The first version got this backwards and produced negative
-absorption; this is fixed and commented in `absorption.py`. Consistency check: for small $Z$ this
-reproduces the standard $\alpha=\omega_p^2\nu/[c\,n(\omega^2+\nu^2)]$.)
+**Densities.** The absorbing density is the merged density used for tracing: `merge_density` gives an
+enhancement on E-CHAIM, or a model below $h_1$ and E-CHAIM above $h_2$ with a cosine blend. E-CHAIM v3.4 with
+`dregion=True` supplies a climatological D layer, so the model must not add its own D layer on top
+(decision D4). `riometer_density` builds an equivalent density from a riometer map (eq. 7.3).
 
-**Collision frequency.** IRI/E-CHAIM supply no neutral atmosphere, and no MSIS-type model is
-included, so $\nu_{\rm eff}$ is a height-only exponential:
+**Collision frequency.** IRI/E-CHAIM supply no neutral atmosphere, so the default $\nu$ is a height-only
+exponential, $\nu=10^{7}\,\mathrm{s^{-1}}\,e^{-(h-70\,\mathrm{km})/6\,\mathrm{km}}$ for $h>0$. **This is an
+illustrative placeholder (D9), not a published fit.** It is continued above 130 km instead of cut: a step in
+the integrand made the RK4 sum depend on the direction of travel and broke the reciprocity test (§5.5).
 
-$$
-\nu_{\rm eff}(h)=10^{7}\,\mathrm{s^{-1}}\;e^{-(h-70\,\mathrm{km})/6\,\mathrm{km}},\qquad 0<h\le130\ \mathrm{km},
-$$
+**Units.** The batch tracer accumulates $\int\alpha_{\rm amp}\,ds$ in state slot 9 and reports
+`absorption_db = 8.686 A`. Slot 11 holds the part from heights below 120 km (`absorption_D_dB`).
+Each ground contact stores the full state, so per-hop sums are differences of successive hop states.
 
-and 0 outside. **This is an illustrative placeholder, not a published fit.** Any absolute
-absorption number inherits that uncertainty; pass a callable `absorption_model=fn(alt_km)` to
-substitute a real profile.
-
-**Units — read this.** The engine stores $A$ in `state[9]` and converts it in
-`TraceResult.absorption_db_total`. Because $\alpha$ is a **power** coefficient, the conversion
-should be $10\log_{10}e\approx4.343\,A$. The code currently applies $8.686\,A$ (which is the factor for
-an *amplitude* exponent). See §8.1.
-
-**▸ Code:** `absorption.py` (`absorption_rate`, `collision_frequency_profile`); accumulation in
-`_extended_rhs`; dB conversion at the end of `RayTracer.trace`.
+**▸ Code:** `absorption.py` (`absorption_rate`, `sw_F`, `ProfileModel`, `merge_density`,
+`riometer_density`); `batch.py` (slots 9 and 11).
 
 ### 2.9 Scattering by small-scale irregularities (Monte Carlo)
 
@@ -394,16 +395,22 @@ power gain; a wave-optics (Airy) treatment is outside scope.
 
 ### 2.11 The link budget
 
-`link_budget.compute_receiver_statistics` runs **one** adaptive trace with the tangent map, group and
-phase paths, absorption and phase variance all switched on, and reports relative dB terms:
+The one-way budget of a leg (spec §6.2–6.4, eq. 6.2–6.3) is
 
 $$
-\text{total}=G_{\rm focus}-L_{\rm abs}-L_{\rm coh},\qquad L_{\rm coh}=\tfrac{10}{\ln 10}\,\sigma_\phi^2 .
+P_r=\frac{P_tG_tG_r\lambda_0^2}{(4\pi)^2d_{\rm eff}^2\,L},\qquad
+10\log_{10}L=A_{\rm abs}+\sum L_g+L_{\rm pol}+L_{\rm other},
 $$
 
-There is **no transmitter EIRP, antenna gain, or receiver model** anywhere in Hamilton, so `total`
-is a *relative* figure, not a received power. It is `None` if the ray did not land. It is
-rigorous for a single hop only (§8.3).
+with $d_{\rm eff}$ the caustic-capped flux-tube distance (eq. 4.7, §4.5, from the five-ray landing
+mini-fan of `legs.landing_mini_fan`), $L_{\rm pol}=3.01$ dB per leg (§6.4) and the ground loss $L_g$ of
+every bounce. The focusing gain $G_f=10\log_{10}(P'^2/d_{\rm eff}^2)$ with the group path $P'$ (decision
+D2) is reported for information. **There is no coherence term** (§6.3 pitfall): the earlier
+$L_{\rm coh}=\tfrac{10}{\ln10}\sigma_\phi^2$ is removed. The API reports the relative total
+$G_f-L$; it has no EIRP or receiver model, so `received_dBW` is set only when the caller gives $P_t$.
+
+**▸ Code:** `legs.py` (`landing_mini_fan`, `leg_mode`, `one_way_power_dB`), `link_budget.py`
+(`one_way_budget`), `api.py` (`Link.link_budget`).
 
 ### 2.12 Reflection at the ground and multiple hops
 
@@ -431,7 +438,7 @@ ground is a perfect specular reflector: no reflection loss, no roughness, no Fre
   design — they are reporting quantities, not physics boundaries, and Vincenty/Karney geodesics are
   not justified by the payoff.
 
-### 3.2 Electron density (`ionosphere.py`, `ECHAIM/`)
+### 3.2 Electron density (`geophysics/ionosphere.py`, `geophysics/ECHAIM/`)
 
 * **Two models, one grid, per-point selection.** E-CHAIM (Themens et al. 2017/18; an empirical,
   data-assimilating high-latitude model) is used wherever it returns a value, i.e. where the
@@ -449,14 +456,14 @@ ground is a perfect specular reflector: no reflection loss, no roughness, no Fre
   $=\mathrm{path}/R_{\rm mean}\times1.3$ (margin), clamped to [2°, 180°], centred on the launch
   point — a conservative straight-line bound. For a launch above the 800 km ceiling it is centred on
   the entry point instead.
-* **E-CHAIM binding.** The vendored CHAIN C library is called through `ctypes` (`ECHAIM/echaim.py`,
-  built by `ECHAIM/build.sh`). One patch was made to the vendored source: `getDir()` normally reads a
+* **E-CHAIM binding.** The vendored CHAIN C library is called through `ctypes` (`geophysics/ECHAIM/echaim.py`,
+  built by `geophysics/ECHAIM/build.sh`). One patch was made to the vendored source: `getDir()` normally reads a
   config file from the CWD and *blocks on stdin* if it is absent; `echaim_init(dir)` sets the same global
   directly. The bundled `CHAIM_DB.db` is an index-history **snapshot** (no auto-update; `updateLocalDB.c`
   is excluded because it needs libcurl). Querying past its coverage still returns a value (the library falls
   back to medians), with reduced accuracy in the storm/precipitation terms. Options: storm off,
   precipitation on, E-CHAIM's own D-region off (absorption handles the D-region separately).
-  E-CHAIM is **GPL-3.0**; its licences are in `ECHAIM/licenses/`.
+  E-CHAIM is **GPL-3.0**; its licences are in `geophysics/ECHAIM/licenses/`.
 
 ### 3.3 Magnetic field (`igrf.py`)
 
@@ -550,56 +557,78 @@ typically a few seconds at the default resolution (memory-hungry at large `n_ang
 
 ### 5.1 Module map
 
+The code is split into folders (Python packages, imported from the project root, e.g. `from raytracing.main import
+Ray`); each folder has a `README.md` describing its files. The modules this document covers:
+
 | module | role | depends on |
 |---|---|---|
 | `api.py` | **public interface**: `Link`, `RayPath`, `ScatterResult`, `LinkBudget` | everything below |
-| `main.py` | `Ray` (the physics RHS), `build_ionosphere_for_ray`; a legacy `__main__` demo | ionosphere, geometry |
-| `raytracer.py` | `RayTracer` (extended RHS, both drivers, hop loop, tangent-map pass), `TraceResult` | absorption, geometry |
-| `absorption.py` | collision-frequency profile; complex-$X$ absorption rate | `Ray._appleton_hartree_p` |
-| `mc_scattering.py` | irregularity spectrum + tabulated kick statistics; `MCScatteringTracer` (thin subclass of `RayTracer`) | raytracer |
-| `link_budget.py` | focusing gain + absorption + coherence → relative dB | raytracer |
-| `ionosphere.py` | E-CHAIM + IRI-2020 density patch, trilinear interpolation | iricore, `ECHAIM/`, geometry |
-| `ECHAIM/` | vendored C library + `ctypes` binding | libc, SQLite (vendored) |
-| `igrf.py` | IGRF-13 field patch | ppigrf, geometry |
-| `geometry.py` | WGS84 transforms, ellipsoid intersection, ranges | numpy |
-| `visualization.py` | interactive 3-D Plotly scene, duck-typed on `.path` | plotly |
-| `constants.py` | $c$, $q_e$, $m_e$, $\varepsilon_0$, $\mu_0$ | — |
-| `test_iono.py` | legacy Chapman-layer test, unused | — |
+| `raytracing/main.py` | `Ray` (the physics RHS), `build_ionosphere_for_ray`; a legacy `__main__` demo | ionosphere, geometry |
+| `raytracing/raytracer.py` | `RayTracer` (extended RHS, both drivers, hop loop, tangent-map pass), `TraceResult` | absorption, geometry |
+| `raytracing/batch.py` | `BatchTracer`: the fixed-step algorithm vectorised over many rays, records, Doppler | absorption, ground, geometry |
+| `raytracing/absorption.py` | collision-frequency profile; complex-$X$ absorption rate | `Ray._appleton_hartree_p` |
+| `raytracing/mc_scattering.py` | irregularity spectrum + tabulated kick statistics; `MCScatteringTracer` (thin subclass of `RayTracer`) | raytracer |
+| `propagation/link_budget.py` | one-way power budget of a leg (focusing, absorption, ground and polarisation losses) | legs, batch |
+| `geophysics/ionosphere.py` | E-CHAIM + IRI-2020 density patch, trilinear interpolation | iricore, `geophysics/ECHAIM/`, geometry |
+| `geophysics/ECHAIM/` | vendored C library + `ctypes` binding | libc, SQLite (vendored) |
+| `geophysics/igrf.py` | IGRF-13 field patch | ppigrf, geometry |
+| `core/geometry.py` | WGS84 transforms, ellipsoid intersection, ranges | numpy |
+| `plotting/` | PHaRLAP-style figures (range-height slice, 3-D lat/lon/height) with the HiCIRF channel; the old Plotly scene in `plotting/plotly_3d.py` | matplotlib, plotly |
+| `core/constants.py` | $c$, $q_e$, $m_e$, $\varepsilon_0$, $\mu_0$ | — |
+| `legacy/test_iono.py` | legacy Chapman-layer model, unused | — |
 
-Dependencies are a DAG: `geometry` was pulled out of `main.py` precisely so `raytracer` and `absorption`
-could use it without a circular import.
+The channel-simulator stages built on top (fans and homing in `propagation/`, phase screens and channel parameters
+in `stochastic/`, targets and clutter in `echoes/`, noise and CIR output in `receiver/`) are described in their
+folders' READMEs and in `docs/implementation_plan.md`.
+
+Dependencies are a DAG, between modules and between folders (`core` <- `geophysics` <- `raytracing` <-
+`propagation` <- `echoes` <- `receiver`; `stochastic` needs only `core`): `geometry` was pulled out of `main.py`
+precisely so `raytracer` and `absorption` could use it without a circular import.
 
 ### 5.2 Design of the public API
 
 `api.Link` is a *transmitter*: place + moment + default frequency and mode. The constructor does all the
-expensive work once; then
+expensive work once (the ionosphere and field patches); then
 
-* `trace(elevation_deg, azimuth_deg, …)` → `RayPath`
-* `scatter(elevation_deg, …, n_rays=200, seed=…)` → `ScatterResult`
-* `link_budget(elevation_deg, …)` → `LinkBudget`
-* `sweep_elevation / sweep_azimuth / sweep_frequency` → `list[RayPath]`
-* `plot(...)`, `grid_info()`, `.ionosphere`, `.magnetic_field`
+* `trace(elevation_deg, azimuth_deg, …)` → `RayPath`; `sweep_elevation / sweep_azimuth / sweep_frequency` →
+  `list[RayPath]`
+* `link_budget(elevation_deg, …)` → `LinkBudget` (one-way dB budget of the leg)
+* `channel(ray)` → `ChannelParams`: the HiCIRF stochastic channel of a traced ray's leg (phase screens from the
+  Link's irregularity inputs or models, then Algorithm 5); `leg_channel(elevation_deg, …)` is `channel(trace(…))`
+* `plot(*rays, highlight=…)` (PHaRLAP-style range-height figure with the HiCIRF channel of the highlighted ray),
+  `plot_3d(*rays)`, `plot_scattering_function(ray)`, `plot_html(*rays)` (interactive Plotly); `RayPath.plot()` and
+  `plot_3d()` for a single ray without the ionosphere
+* `.ionosphere`, `.magnetic_field`, `electron_density_xyz_m(…)`, `grid_info()`
+* `scatter(elevation_deg, …)` → `ScatterResult`: the deprecated Monte Carlo layer (D6), warns
+
+A `RayPath` keeps the per-step record of its leg (`RayPath.samples`, a `RaySamples`), so `channel(ray)` and the
+HiCIRF part of `plot()` work on the very ray that was traced (its own budget, hops and step). The irregularity
+inputs are one `IrregularityInputs` (`Link(irregularity=…)`, with `xi_rms`, `L0_km`, `p_index`, `axial_ratio` as
+shortcuts for single fields) unless `irregularity_model` / `drift_model` replace them.
 
 Frequency and mode can be overridden **per call**; the `Ray` for each (frequency, mode) pair is cached,
 and it reuses the same patch. **Unit convention of the API:** km, MHz, degrees, dB, ms; ECEF positions are
-the one exception and stay in metres (so a `RayPath` can be handed straight to `visualization.plot_ray`).
+the one exception and stay in metres (so a `RayPath` can be handed straight to the `plotting/` functions).
 
 Guard rails and traps:
 
 * The patch is sized by `max_path_km × max_nhops` at construction. Asking `trace()` for a longer path than
-  the `Link` was built for **silently runs past the patch edge** (density → 0, field clamped).
-* `tangent_map=True` silently switches to `method="adaptive"`.
-* `RayPath.sigma_phi2` is `None` unless `phase_variance=True` (or it came from `scatter`).
+  the `Link` was built for **silently runs past the patch edge** (density → 0, field clamped). E-CHAIM has been seen
+  to crash building patches wider than about 60°.
+* `RayPath.sigma_phi2` is `None` unless `trace(phase_variance=True)`; `channel(ray).sigma_phi2` is the same number.
+* `channel(ray)` needs the group path (`trace(group_path=True)`, the default).
 * `elevation_deg` is restricted to [0, 90]; azimuth is clockwise from true north.
+* `RayPath`, `LinkBudget` and `ScatterResult` compare by identity (they hold arrays).
 
 ### 5.3 Data flow of one `trace()` call
 
 1. `Link._direction`: (elevation, azimuth) → unit vector in the local ENU frame at the transmitter → ECEF.
 2. `Link._resolve_ray`: get/create `Ray(ω, MODE, Ne, B)`.
-3. `RayTracer.trace`: initial extended state; loop over hops: pick a driver, integrate one segment, stop on an event;
-   on GROUND, reflect $\mathbf u$ and continue if hops remain.
-4. Assemble `TraceResult` (totals, decimated path, bounce points, ground range).
-5. `_build_ray_path`: unit conversion, arrival elevation (against the *ellipsoid* normal), wrap into `RayPath`.
+3. `BatchTracer.trace` (one ray, `record_states=True`): fixed-step RK4 with step rejection; loop over hops,
+   locating the ground crossing and reflecting $\mathbf u$ about the WGS84 normal while hops remain.
+4. `samples_from_record`: the per-step `RaySamples` of the leg, with the transported transverse frame.
+5. `_ray_path_from_batch`: unit conversion, arrival elevation (against the *ellipsoid* normal), wrap into `RayPath`
+   (with the samples). With `phase_variance=True`, the leg's phase screens give `sigma_phi2`.
 
 ---
 
@@ -613,19 +642,23 @@ link = Link(57.0, 10.0, frequency_mhz=8.0,
             dt=datetime(2024, 6, 21, 14, 0, 0), mode="O")   # builds Ne + B once
 
 ray = link.trace(elevation_deg=28.0)        # deterministic ray
-print(ray)                                   # landing, range, delay, absorption
-budget = link.link_budget(elevation_deg=28.0)
-ens = link.scatter(elevation_deg=28.0, n_rays=200, seed=1)   # minutes
-ray.plot().write_html("ray.html")           # rotate/zoom in a browser
+print(ray)                                   # end point, range, delay, absorption
+fan = link.sweep_elevation(range(5, 50, 4))
+print(link.link_budget(elevation_deg=28.0))  # one-way dB budget
+print(link.channel(ray))                     # HiCIRF channel of the leg
+link.plot(fan, highlight=ray).savefig("rays.png")   # PHaRLAP-style figure + the red ray's HiCIRF channel
+link.plot_scattering_function(ray)           # delay-Doppler scattering function
 ```
 
-`example.py` is exactly this in ~20 lines. **Requirements:** Python 3, `numpy`, `scipy`, `plotly`,
-`iricore`, `ppigrf` (+`pandas`), a C compiler (the E-CHAIM library is built on first import via
-`ECHAIM/build.sh`), optionally `global-land-mask` (land/ocean shading) and `matplotlib` (legacy demo).
+`example.py` is a version of this. **Requirements:** Python 3, `numpy`, `scipy`, `matplotlib`, `plotly`,
+`iricore`, `ppigrf` (+`pandas`), `netCDF4` (CCMP wind), a C compiler (the E-CHAIM library is built on first import
+via `geophysics/ECHAIM/build.sh`), optionally `global-land-mask` (land/ocean shading in the Plotly scene).
 Working reference: the project `venv/`.
 
-Low-level access (custom tracing, tests): `build_ionosphere_for_ray` → `build_igrf_for_ionosphere` →
-`Ray` → `RayTracer.trace(r0, u0, max_path_m, method=…, nhops=…, scatter=…, carry_tangent_map=…)`.
+Low-level access (custom tracing, tests): `build_ionosphere_for_ray` (`raytracing.main`) → `build_igrf_for_ionosphere`
+(`geophysics.igrf`) → `Ray` (`raytracing.main`) → `BatchTracer(ray, ds_m=…).trace(r0, u0[None], max_path_m, nhops=…,
+record_states=True)` (`raytracing.batch`), or the scalar `RayTracer.trace(r0, u0, max_path_m, method=…, nhops=…,
+scatter=…, carry_tangent_map=…)` (`raytracing.raytracer`) for the adaptive driver and the tangent map.
 `u0` is a *unit* vector (launched from vacuum, $n=1$).
 
 ---
@@ -660,7 +693,12 @@ focusing, and any comparison against PHaRLAP or measured ionosonde/oblique-sound
 
 ### Defects found in this review (not fixed)
 
-**8.1 Absorption in dB is 2× too large.** `absorption_rate` returns the *power* coefficient
+**8.0 X-mode ray direction (fixed, Phase 0).** The plasma-branch RHS was not multiplied by MODE, so X-mode
+rays moved against the group velocity. Checked against $\partial\omega/\partial\mathbf k$ from the dispersion
+relation and the energy-flux argument. **X-mode results are internally validated only** (no external
+reference, PHaRLAP, offline): `LegMode.xmode_validated = False` until one is found.
+
+**8.1 Absorption in dB was 2× too large (fixed, Phase 0).** `absorption_rate` returns the *power* coefficient
 $\alpha=2k_0\,\mathrm{Im}\,n$ (the docstring says so and the small-$Z$ limit confirms it), so
 $A=\int\alpha\,ds$ is the power exponent and the loss in dB is $10\log_{10}(e^{A})=4.343\,A$.
 `raytracer.py` (`result.absorption_db_total = 8.686 * float(state[9])`) and the docstrings in
@@ -669,7 +707,7 @@ exponent. Every `absorption_db`, `LinkBudget.absorption_db` and `LinkBudget.tota
 too large by exactly 2 for a given $\nu_{\rm eff}$ (and `absorption_nepers_total` is a *power* exponent
 despite the name). Fix: one constant, plus comments.
 
-**8.2 Group path is approximate and locally wrong near reflection.** `_group_index` takes
+**8.2 Group path was approximate and locally wrong near reflection (fixed, Phases 0 and 1).** `_group_index` takes
 $n_g=n+\omega\,\partial n/\partial\omega$ by re-solving (2) at $\omega\pm\delta\omega$ while holding
 $Y_d=\hat{\mathbf Y}\cdot\mathbf u$ **fixed**. The correct quantity is the derivative at fixed *wave-normal
 direction* (or, equivalently in the Hamiltonian picture, $dP_g/d\tau=-\omega\,\partial F/\partial\omega|_{\mathbf k}$), and the
@@ -699,13 +737,14 @@ are rigorous for `nhops=1` only.
 mid-latitude $10^{-3}$–$10^{-2}$, spread-F up to $10^{-1}$). Static irregularities only. Kicks use the rates at the
 end of each step. `mc_scattering.py`'s header describes a validation harness ("run this file directly") that is not present.
 
-**8.5 Doppler.** Not implemented; `doppler_shift_hz` is always `None` and `compute_doppler` raises `NotImplementedError`.
-A physically correct Doppler needs two ionosphere epochs.
+**8.5 Doppler.** Implemented in the batch path (Method B, spec eq. 4.8): $\int g\,\partial_tN_e\,ds$ accumulated in state slot 10, with $\partial_tN_e$ from two epochs (`ionosphere.EpochPair`) and the convective term $-v_d\cdot\nabla N_e$. The single-epoch API `Link` reports no Doppler (NaN).
 
 **8.6 Mode degeneracy.** Besides $X=0$ (handled), $\partial F/\partial\mathbf u\to0$ wherever the O and X roots coincide,
 which includes $Y\to0$ (frequency $\gg$ the gyrofrequency — not the HF regime, where $Y\approx0.02$–$0.2$, but the
 step-size compensation and the $\max(\cdot,0)$ clip on the discriminant lose accuracy as $Y$ shrinks). Also unguarded:
 the resonance $a=1-X-Y^2=0$, and a negative discriminant, which is silently clipped to 0 (the ray is pushed onto the degenerate point rather than an error being reported).
+
+**8.6a B = 0 exactly.** Haselgrove's form is degenerate at $\mathbf B=0$: $\dot{\mathbf r}\equiv0$ (double root). Tests use a small non-zero field (east-directed or dipped). Not a numerical issue.
 
 **8.7 Numerical smoothness.** Density is trilinear on 2 km cells (§3.4) and the field is linear on a coarse 5×5×5 grid
 (≈ 10° cells over a typical patch, ~200 km in height), so $\nabla N_e,\nabla\mathbf B$ are piecewise constant. For
@@ -716,17 +755,17 @@ the ~0.1 % convergence floor.
 spacing (a few degrees) is interpolated, not modelled; storm and E-CHAIM-D-region options are off; the CHAIM index
 snapshot is not auto-refreshed; the collision-frequency profile is illustrative (§2.8).
 
-**8.9 Ground.** Smooth, perfectly reflecting ellipsoid, no terrain, no sea/land reflection coefficients (`visualization`
-colours land/ocean but this is purely cosmetic).
+**8.9 Ground.** Smooth, perfectly reflecting ellipsoid, no terrain, no sea/land reflection coefficients (the Plotly scene
+`plotting/plotly_3d.py` colours land/ocean but this is purely cosmetic).
 
 ### Practical pitfalls
 
 * **Memory.** On a memory-constrained machine the E-CHAIM/IRI query at large `n_ang` can stall (observed as a hang at
   "Querying E-CHAIM" at `n_ang=15` under exhausted swap; `n_ang=6` was instant). This was environmental, not an algorithm issue.
 * **Path budget vs patch.** See §5.2.
-* **Stale/legacy code.** `main.py`'s `__main__` block still uses the low-level pipeline (75×75 query, 200-ray ensemble,
-  matplotlib figure); `test_iono.py` tests a discarded Chapman-layer model; `ECHAIM/build.sh` mentions an `ECHAIM/README.md`
-  that does not exist.
+* **Stale/legacy code.** `raytracing/main.py`'s `__main__` block (`python -m raytracing.main`) still uses the low-level
+  pipeline (75×75 query, 200-ray ensemble, matplotlib figure); `legacy/test_iono.py` is a discarded Chapman-layer model;
+  `geophysics/ECHAIM/build.sh` mentions an `ECHAIM/README.md` that does not exist.
 * **Version control.** At review time `absorption.py, api.py, example.py, geometry.py, igrf.py, link_budget.py, mc_scattering.py,
   raytracer.py` and `ECHAIM/` are untracked, and there is no `.gitignore` (`venv/`, `__pycache__/`, `ECHAIM/etc/` ≈115 MB and the built
   `libechaim.so` would all be swept in).
