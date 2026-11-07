@@ -1,0 +1,14 @@
+# Python environment and caches (plan decision D7)
+venv/
+__pycache__/
+*.pyc
+*.o
+
+# Generated outputs (example.py, the raytracing.main demo)
+example_ray.html
+example_ray.png
+ray_scene_3d.html
+
+# Copyrighted papers, kept locally only (see docs/README.md for the references)
+docs/1972Barrick_RST.pdf
+docs/Journal of Geophysical Research*.pdf
